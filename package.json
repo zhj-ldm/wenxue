@@ -1,0 +1,20 @@
+{
+  "name": "wenxue",
+  "productName": "Wenxue",
+  "version": "1.0.0",
+  "description": "问学 · 内置 pi Agent 的 AI 试卷练习桌面应用",
+  "main": "electron/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging",
+    "build:app": "./scripts/build-app.sh"
+  },
+  "devDependencies": {
+    "electron": "^45.0.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^1.5.2",
+    "@earendil-works/pi-ai": "^1.5.2"
+  }
+}
