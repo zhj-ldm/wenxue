@@ -3,18 +3,48 @@
   "productName": "Wenxue",
   "version": "1.0.0",
   "description": "问学 · 内置 pi Agent 的 AI 试卷练习桌面应用",
+  "author": "zhj-ldm",
   "main": "electron/main.js",
   "private": true,
   "scripts": {
     "start": "electron .",
     "dev": "electron . --enable-logging",
-    "build:app": "./scripts/build-app.sh"
+    "build:app": "./scripts/build-app.sh",
+    "build:win": "electron-builder --win nsis --x64 --publish never"
   },
   "devDependencies": {
-    "electron": "^45.0.0"
+    "electron": "^45.0.0",
+    "electron-builder": "^26.0.12"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^1.5.2",
     "@earendil-works/pi-ai": "^1.5.2"
+  },
+  "build": {
+    "appId": "com.wenxue.desktop",
+    "productName": "Wenxue",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "renderer/**/*",
+      "prompts/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-${version}-win-${arch}-setup.${ext}"
+    }
   }
 }
