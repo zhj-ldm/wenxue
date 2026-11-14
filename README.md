@@ -75,7 +75,10 @@
 
 ## 下载
 
-前往 [Releases](../../releases) 下载最新的 macOS 版本（Apple Silicon）。
+前往 [Releases](../../releases) 下载最新的 macOS 版本（Apple Silicon），两种格式任选：
+
+- **DMG**（推荐）：打开后把「问学.app」拖进 Applications 即可
+- **ZIP**：解压后手动拖入 Applications
 
 > 应用使用 ad-hoc 签名，首次打开若被系统拦截，请在「系统设置 → 隐私与安全性」中点「仍要打开」，或执行：
 >
