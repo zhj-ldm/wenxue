@@ -75,18 +75,24 @@
 
 ## 下载
 
-前往 [Releases](../../releases) 下载最新的 macOS 版本（Apple Silicon），两种格式任选：
+前往 [Releases](../../releases) 下载最新的版本：
 
+**macOS（Apple Silicon）**
 - **DMG**（推荐）：打开后把「问学.app」拖进 Applications 即可
 - **ZIP**：解压后手动拖入 Applications
 
-> 应用使用 ad-hoc 签名，首次打开若被系统拦截，请在「系统设置 → 隐私与安全性」中点「仍要打开」，或执行：
+**Windows（x64）**
+- **EXE**：运行安装包，可选安装目录
+
+> macOS 版使用 ad-hoc 签名，首次打开若被系统拦截，请在「系统设置 → 隐私与安全性」中点「仍要打开」，或执行：
 >
 > ```bash
 > xattr -dr com.apple.quarantine /Applications/问学.app
 > ```
 
-**系统要求**：macOS 12+ / Apple Silicon
+**系统要求**：macOS 12+ / Apple Silicon，或 Windows 10 及以上（x64）
+
+> Windows 版由 GitHub Actions 自动构建，见 [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml)。
 
 ---
 
