@@ -38,7 +38,7 @@ function listDir(dir) {
     .join('\n');
 }
 
-function makeTools(baseDir) {
+function makeTools(baseDir, hooks = {}) {
   const read = {
     name: 'read',
     label: 'Read',
@@ -159,7 +159,174 @@ function makeTools(baseDir) {
     }
   };
 
-  return [read, write, edit, bash];
+  const taskTools = [];
+  if (hooks.createCarrier) {
+    taskTools.push(
+      {
+        name: 'create_carrier',
+        label: 'CreateCarrier',
+        description:
+          '创建一个载体：kind=paper（整套试卷）、practice（专项练习）、plan（提升计划）。sections 里每个大题可写 date（YYYY-MM-DD），题目也可单独写 date；到期后会自动进入每日任务。题目支持 actions（控制批改/讲解/对话按钮）和 answerMode（fixed 固定答案 / open 答案不唯一）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            kind: { type: 'string', description: 'paper / practice / plan' },
+            title: { type: 'string' },
+            subject: { type: 'string' },
+            grade: { type: 'string' },
+            goal: { type: 'string', description: '计划目标，practice/paper 可留空' },
+            instructions: { type: 'string' },
+            durationMinutes: { type: 'number', description: 'paper 可填，其它填 0' },
+            sections: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  passage: { type: 'string' },
+                  date: { type: 'string' },
+                  questions: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        type: { type: 'string' },
+                        layout: { type: 'string', description: 'block / inline' },
+                        stem: { type: 'string' },
+                        passage: { type: 'string' },
+                        blanks: { type: 'array', items: { type: 'object' } },
+                        options: { type: 'array', items: { type: 'object' } },
+                        maxScore: { type: 'number' },
+                        referenceAnswer: { type: 'string' },
+                        rubric: { type: 'array', items: { type: 'object' } },
+                        knowledgePoints: { type: 'array', items: { type: 'string' } },
+                        difficulty: { type: 'number' },
+                        date: { type: 'string' },
+                        answerMode: { type: 'string', description: 'fixed / open' },
+                        actions: { type: 'object', description: '{ grade, explain, chat } 布尔值' }
+                      },
+                      required: ['stem', 'maxScore']
+                    }
+                  }
+                },
+                required: ['questions']
+              }
+            }
+          },
+          required: ['kind', 'title', 'sections']
+        },
+        executionMode: 'sequential',
+        execute: async (_id, params) => {
+          const res = await hooks.createCarrier(params || {});
+          return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }], details: res };
+        }
+      },
+      {
+        name: 'update_carrier',
+        label: 'UpdateCarrier',
+        description: '按 8 位编号更新载体：可改标题、目标、章节与题目（传入完整 sections 会整体替换，传入部分字段则合并）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', description: '载体 8 位编号' },
+            patch: { type: 'object', description: '要更新的字段，如 { title, goal, sections }' }
+          },
+          required: ['code', 'patch']
+        },
+        executionMode: 'sequential',
+        execute: async (_id, params) => {
+          const res = await hooks.updateCarrier(params || {});
+          return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }], details: res };
+        }
+      },
+      {
+        name: 'find_carrier',
+        label: 'FindCarrier',
+        description: '按 8 位编号或标题关键词查找载体，返回其结构与完成情况。',
+        parameters: {
+          type: 'object',
+          properties: {
+            code: { type: 'string' },
+            title: { type: 'string' }
+          }
+        },
+        executionMode: 'parallel',
+        execute: async (_id, params) => {
+          const res = await hooks.findCarrier(params || {});
+          return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }], details: {} };
+        }
+      },
+      {
+        name: 'list_carriers',
+        label: 'ListCarriers',
+        description: '列出全部试卷、练习与提升计划（含编号、题量、完成情况）。',
+        parameters: { type: 'object', properties: { kind: { type: 'string' } } },
+        executionMode: 'parallel',
+        execute: async (_id, params) => {
+          const res = await hooks.listCarriers(params || {});
+          return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }], details: {} };
+        }
+      },
+      {
+        name: 'delete_carrier',
+        label: 'DeleteCarrier',
+        description: '按 8 位编号删除一个载体（含作答与对话记录）。',
+        parameters: {
+          type: 'object',
+          properties: { code: { type: 'string' } },
+          required: ['code']
+        },
+        executionMode: 'sequential',
+        execute: async (_id, params) => {
+          const res = await hooks.deleteCarrier(params || {});
+          return { content: [{ type: 'text', text: JSON.stringify(res) }], details: {} };
+        }
+      }
+    );
+  }
+
+  if (hooks.webSearch) {
+    taskTools.push({
+      name: 'web_search',
+      label: 'WebSearch',
+      description: '联网搜索（内置 Aggr Search，多引擎聚合）。需要查资料、确认最新信息、找题目素材时使用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索关键词' },
+          count: { type: 'number', description: '返回条数，默认 6' }
+        },
+        required: ['query']
+      },
+      executionMode: 'parallel',
+      execute: async (_id, params) => {
+        const res = await hooks.webSearch(params || {});
+        return { content: [{ type: 'text', text: typeof res === 'string' ? res : JSON.stringify(res, null, 2) }], details: {} };
+      }
+    });
+  }
+
+  if (hooks.webFetch) {
+    taskTools.push({
+      name: 'web_fetch',
+      label: 'WebFetch',
+      description: '抓取网页正文（内置 Aggr Search）。搜到合适的链接后，用它读取完整内容。',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: '要抓取的网页地址' }
+        },
+        required: ['url']
+      },
+      executionMode: 'parallel',
+      execute: async (_id, params) => {
+        const res = await hooks.webFetch(params || {});
+        return { content: [{ type: 'text', text: typeof res === 'string' ? res : JSON.stringify(res, null, 2) }], details: {} };
+      }
+    });
+  }
+
+  return [read, write, edit, bash, ...taskTools];
 }
 
 module.exports = { makeTools, resolvePath };

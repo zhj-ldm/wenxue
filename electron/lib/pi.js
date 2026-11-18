@@ -34,12 +34,13 @@ function buildModel(profile, modelId) {
     api: 'openai-completions',
     provider: String(profile.id || 'custom'),
     baseUrl: normalizeBaseUrl(profile.baseUrl),
-    reasoning: false,
+    reasoning: true,
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: Number(profile.contextWindow) || 128000,
-    maxTokens: Number(profile.maxTokens) || 8192,
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false }
+    // 输出不再设上限：给到上下文窗口大小，具体由模型/接口自身决定
+    maxTokens: Number(profile.contextWindow) || 128000,
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true }
   };
 }
 
@@ -77,7 +78,7 @@ function errorOf(message) {
 
 /* ---------------- 纯文本补全（批改 / 讲解 / 题目对话） ---------------- */
 
-async function completeText({ profile, systemPrompt, messages, model: modelId, timeoutMs = 180000, signal }) {
+async function completeText({ profile, systemPrompt, messages, model: modelId, thinkingLevel = 'off', timeoutMs = 180000, signal }) {
   const { models, model } = await makeModels(profile, modelId);
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -87,7 +88,11 @@ async function completeText({ profile, systemPrompt, messages, model: modelId, t
     const result = await models.complete(
       model,
       { systemPrompt, messages: messages || [], tools: [] },
-      { apiKey: profile.apiKey || 'no-key', signal: controller.signal }
+      {
+        apiKey: profile.apiKey || 'no-key',
+        signal: controller.signal,
+        reasoning: thinkingLevel === 'off' ? undefined : thinkingLevel
+      }
     );
     const err = errorOf(result);
     if (err && !textOf(result)) throw new Error(err);
@@ -102,10 +107,15 @@ async function completeText({ profile, systemPrompt, messages, model: modelId, t
 
 const sessions = new Map(); // sessionId -> { agent, profileId, model, baseDir }
 
-async function startAgent({ runId, profile, baseDir, systemPrompt, tools = true, model: modelId, sessionId }) {
+async function startAgent({ runId, profile, baseDir, systemPrompt, tools = true, toolHooks = {}, model: modelId, sessionId, thinkingLevel = 'medium' }) {
   const { core } = await libs();
   const reuse = sessionId ? sessions.get(sessionId) : null;
   if (reuse && reuse.profileId === profile.id && reuse.baseDir === baseDir) {
+    try {
+      reuse.agent.state.thinkingLevel = thinkingLevel;
+    } catch {
+      /* 旧版本不支持时忽略 */
+    }
     runs.set(runId, { agent: reuse.agent });
     return reuse.agent;
   }
@@ -114,7 +124,8 @@ async function startAgent({ runId, profile, baseDir, systemPrompt, tools = true,
     initialState: {
       systemPrompt,
       model,
-      tools: tools ? makeTools(baseDir) : []
+      thinkingLevel,
+      tools: tools ? makeTools(baseDir, toolHooks) : []
     },
     streamFn: models.streamSimple.bind(models),
     getApiKey: async () => profile.apiKey || 'no-key',
@@ -144,9 +155,10 @@ function resetSession(sessionId) {
  * 跑一轮对话。
  * @returns {{text:string, tools:Array, error:string, cancelled:boolean}}
  */
-async function runAgent({ runId, profile, baseDir, systemPrompt, prompt, sessionId, model, onEvent, timeoutMs = 300000 }) {
-  const agent = await startAgent({ runId, profile, baseDir, systemPrompt, tools: true, model, sessionId });
+async function runAgent({ runId, profile, baseDir, systemPrompt, prompt, sessionId, model, onEvent, toolHooks, thinkingLevel = 'medium', timeoutMs = 300000 }) {
+  const agent = await startAgent({ runId, profile, baseDir, systemPrompt, tools: true, toolHooks, model, sessionId, thinkingLevel });
   let buffer = '';
+  let thinking = '';
   const usedTools = [];
   const pending = new Map();
   let failure = '';
@@ -169,6 +181,11 @@ async function runAgent({ runId, profile, baseDir, systemPrompt, prompt, session
       if (inner && inner.type === 'text_delta' && inner.delta) {
         buffer += inner.delta;
         if (onEvent) onEvent({ type: 'text', full: buffer, text: inner.delta });
+      } else if (inner && inner.type === 'thinking_delta' && inner.delta) {
+        thinking += inner.delta;
+        if (onEvent) onEvent({ type: 'thinking', full: thinking, text: inner.delta });
+      } else if (inner && inner.type === 'thinking_end') {
+        if (onEvent) onEvent({ type: 'thinking_end', full: thinking });
       }
       return;
     }
@@ -176,7 +193,7 @@ async function runAgent({ runId, profile, baseDir, systemPrompt, prompt, session
       const title = summarizeArgs(event.args);
       pending.set(event.toolCallId, { tool: event.toolName, title });
       usedTools.push({ tool: event.toolName, title, status: 'completed' });
-      if (onEvent) onEvent({ type: 'tool', id: event.toolCallId, tool: event.toolName, title, status: 'running' });
+      if (onEvent) onEvent({ type: 'tool', id: event.toolCallId, tool: event.toolName, title, args: event.args, status: 'running' });
       return;
     }
     if (event.type === 'tool_execution_end') {
@@ -190,7 +207,10 @@ async function runAgent({ runId, profile, baseDir, systemPrompt, prompt, session
           id: event.toolCallId,
           tool: event.toolName || meta.tool,
           title: meta.title || '',
-          status
+          isError: !!event.isError,
+          status,
+          result: summarizeResult(event.result),
+          durationMs: event.durationMs
         });
       }
       return;
@@ -226,18 +246,37 @@ async function runAgent({ runId, profile, baseDir, systemPrompt, prompt, session
   }
 
   if (!buffer.trim() && failure && !cancelled) throw new Error(failure);
-  return { text: buffer, tools: usedTools, error: failure, cancelled };
+  return { text: buffer, thinking, tools: usedTools, error: failure, cancelled };
 }
 
 function summarizeArgs(args) {
   if (!args || typeof args !== 'object') return '';
-  const keys = ['command', 'path', 'filePath', 'query', 'pattern'];
+  const keys = ['command', 'path', 'filePath', 'query', 'pattern', 'url'];
   for (const key of keys) {
     if (typeof args[key] === 'string' && args[key].trim()) {
       return args[key].trim().replace(/\s+/g, ' ').slice(0, 160);
     }
   }
   return '';
+}
+
+function summarizeResult(result) {
+  if (result == null) return '';
+  if (typeof result === 'string') return result.slice(0, 4000);
+  if (Array.isArray(result)) return result.map(summarizeResult).filter(Boolean).join('\n').slice(0, 4000);
+  if (Array.isArray(result.content)) {
+    return result.content
+      .map((part) => (part && typeof part.text === 'string' ? part.text : ''))
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 4000);
+  }
+  if (typeof result.text === 'string') return result.text.slice(0, 4000);
+  try {
+    return JSON.stringify(result).slice(0, 4000);
+  } catch {
+    return '';
+  }
 }
 
 function cancel(runId) {

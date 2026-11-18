@@ -1,96 +1,25 @@
 import { call, onAiEvent } from '../api.js';
-import { h, md, toast, uid } from '../ui.js';
-
-// 进程内保留对话记录：切到别的页面再回来还能看到
-let history = [];
-
-const TOOL_GLYPH = {
-  bash: '$',
-  shell: '$',
-  read: '▤',
-  write: '✎',
-  edit: '✎',
-  patch: '✎',
-  grep: '⌕',
-  glob: '✦',
-  ls: '☰',
-  list: '☰',
-  webfetch: '↗',
-  websearch: '↗',
-  fetch: '↗',
-  task: '◆',
-  todo: '☑',
-  default: '●'
-};
-
-const TOOL_LABEL = {
-  bash: 'Bash',
-  shell: 'Shell',
-  read: 'Read',
-  write: 'Write',
-  edit: 'Edit',
-  patch: 'Patch',
-  grep: 'Grep',
-  glob: 'Glob',
-  ls: 'List',
-  list: 'List',
-  webfetch: 'Fetch',
-  websearch: 'Search',
-  task: 'Task',
-  todo: 'Todo'
-};
-
-function toolGlyph(name) {
-  const key = String(name || '').toLowerCase();
-  return TOOL_GLYPH[key] || TOOL_GLYPH.default;
-}
-
-function toolLabel(name) {
-  const key = String(name || '').toLowerCase();
-  return TOOL_LABEL[key] || name || 'Tool';
-}
-
-function toolState(status) {
-  const s = String(status || '').toLowerCase();
-  if (/error|fail/.test(s)) return 'error';
-  if (/run|pending|start|progress/.test(s)) return 'running';
-  return 'done';
-}
-
-function stateLabel(state) {
-  if (state === 'running') return '运行中';
-  if (state === 'error') return '失败';
-  return '完成';
-}
+import { h, md, toast, uid, timeAgo, modal, confirmDialog } from '../ui.js';
+import { createAgentFlow } from '../agentflow.js';
 
 export async function renderChat(container, ctx) {
   const { state, go } = ctx;
   let profiles = state.boot.providers || [];
-  let activeId = state.boot.activeProfileId || (profiles[0] ? profiles[0].id : '');
-  let models = [];
-
-  async function loadModels() {
-    try {
-      const res = await call('provider:models', {});
-      models = (res && res.models) || [];
-    } catch {
-      models = [];
-    }
-    modelSelect.innerHTML = '';
-    const active = profiles.find((p) => p.id === activeId);
-    modelSelect.appendChild(h('option', { value: '' }, active ? `跟随接口（${active.model}）` : '跟随接口配置'));
-    models.forEach((m) => modelSelect.appendChild(h('option', { value: m.id }, m.name || m.id)));
-  }
+  let activeProfile = state.boot.activeProfileId || (profiles[0] ? profiles[0].id : '');
 
   let busy = false;
   let pinned = true;
   let runId = '';
-  let aiBody = null;
-  let aiBuffer = '';
-  let toolStack = null;
-  let toolCards = new Map();
-  let typing = null;
-  let bubbleWrap = null;
+
+  let conversations = [];
+  let conversationId = '';
+  let loadingConv = false;
+  let flow = null;
+
+  function modelLabel() {
+    const p = profiles.find((item) => item.id === activeProfile);
+    return p ? p.model || p.name || 'AI' : 'AI';
+  }
 
   const log = h('div', { class: 'chat-log' });
   const scroller = h('div', { class: 'chat-scroll' }, log);
@@ -103,6 +32,14 @@ export async function renderChat(container, ctx) {
   scroller.addEventListener('scroll', () => {
     pinned = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 90;
   });
+  scroller.addEventListener('wheel', (event) => {
+    if (event.deltaY < 0) pinned = false;
+  }, { passive: true });
+  scroller.addEventListener('pointerdown', () => {
+    pinned = false;
+  });
+
+  /* ---------------- 消息渲染 ---------------- */
 
   function bubble(role, text) {
     const isUser = role === 'user';
@@ -119,244 +56,6 @@ export async function renderChat(container, ctx) {
     scrollDown(true);
     return { node, body };
   }
-
-  /* 工具调用卡片：紧凑列表，不堆边框 */
-
-  function toolCard(tool) {
-    const st = toolState(tool.status);
-    const name = String(tool.tool || 'tool').toLowerCase();
-    const title = String(tool.title || '');
-    const showTitle = title && title.toLowerCase() !== name;
-    const row = h(
-      'div',
-      { class: `tool-row ${st}` },
-      h('span', { class: 'tool-glyph' }, toolGlyph(name)),
-      h('span', { class: 'tool-name' }, toolLabel(name)),
-      showTitle ? h('span', { class: 'tool-title' }, title) : null,
-      h('span', { class: 'tool-status' }, st === 'running' ? h('i', { class: 'tool-spin' }) : st === 'error' ? '✕' : '✓')
-    );
-    return row;
-  }
-
-  function startAiBubble() {
-    if (bubbleWrap) return bubbleWrap;
-    const b = bubble('ai', '');
-    aiBody = b.body;
-    toolStack = h('div', { class: 'tool-stack' });
-    b.node.querySelector('.chat-bubble').insertBefore(toolStack, aiBody);
-    typing = h('div', { class: 'chat-typing' }, h('i', {}), h('i', {}), h('i', {}));
-    aiBody.appendChild(typing);
-    bubbleWrap = b;
-    return b;
-  }
-
-  function clearTyping() {
-    if (typing) {
-      typing.remove();
-      typing = null;
-    }
-  }
-
-  function upsertTool(ev) {
-    startAiBubble();
-    const key = ev.id || `${ev.tool}:${ev.title}`;
-    let card = toolCards.get(key);
-    if (!card) {
-      card = toolCard(ev);
-      toolCards.set(key, { node: card, tool: ev.tool, title: ev.title });
-      toolStack.appendChild(card);
-    } else {
-      const fresh = toolCard({ tool: ev.tool || card.tool, title: ev.title || card.title, status: ev.status });
-      card.node.replaceWith(fresh);
-      card.node = fresh;
-    }
-    scrollDown();
-  }
-
-  function paintAi(text) {
-    startAiBubble();
-    clearTyping();
-    aiBuffer = text == null ? aiBuffer : text;
-    const prev = aiBody.querySelector('.chat-text-inner');
-    if (!prev) {
-      const inner = h('div', { class: 'chat-text-inner' });
-      aiBody.appendChild(inner);
-      inner.innerHTML = md(aiBuffer);
-    } else {
-      prev.innerHTML = md(aiBuffer);
-    }
-    scrollDown();
-  }
-
-  // 本轮结束时把还在转的卡片落定，避免一直转圈
-  function settleTools(failed) {
-    toolCards.forEach((card) => {
-      const row = card.node;
-      if (!row || !row.classList || !row.classList.contains('running')) return;
-      row.className = `tool-row ${failed ? 'error' : 'done'}`;
-      const status = row.querySelector('.tool-status');
-      if (status) status.textContent = failed ? '✕' : '✓';
-    });
-  }
-
-  function finishAi(finalText) {
-    if (finalText && !aiBuffer) paintAi(finalText);
-    else if (finalText && finalText !== aiBuffer) paintAi(finalText);
-    clearTyping();
-    if (!aiBuffer.trim()) {
-      const content = aiBody.querySelector('.chat-text-inner');
-      if (!content) {
-        const hint = h('div', { class: 'chat-note' }, toolCards.size ? '已完成，没有文字说明。' : '没有返回内容，换个模型或稍后重试。');
-        aiBody.appendChild(hint);
-      }
-    }
-  }
-
-  /* ---------------- 顶部 ---------------- */
-
-  const modelSelect = h('select', { class: 'select chat-model' }, h('option', { value: '' }, '默认模型'));
-
-  const profileSelect = h(
-    'select',
-    { class: 'select chat-model' },
-    profiles.length
-      ? profiles.map((p) => h('option', { value: p.id, selected: p.id === activeId }, p.name || p.model))
-      : h('option', { value: '' }, '未配置接口')
-  );
-  profileSelect.addEventListener('change', async () => {
-    if (busy) {
-      profileSelect.value = activeId;
-      return toast('等这一轮结束再切换接口', 'error');
-    }
-    try {
-      const res = await call('provider:activate', { id: profileSelect.value });
-      profiles = res.profiles;
-      activeId = res.activeProfileId;
-      if (state.boot) {
-        state.boot.providers = profiles;
-        state.boot.activeProfileId = activeId;
-      }
-      await loadModels();
-      toast('已切换接口');
-    } catch (err) {
-      toast(err.message || '切换失败', 'error');
-    }
-  });
-
-  const newChatBtn = h('button', { class: 'btn subtle', type: 'button' }, '新对话');
-  newChatBtn.addEventListener('click', async () => {
-    if (busy) return toast('等这一轮结束再新开对话', 'error');
-    try {
-      await call('agent:chat', { reset: true });
-    } catch {
-      /* ignore */
-    }
-    history = [];
-    log.innerHTML = '';
-    log.appendChild(intro());
-    toast('已开始新对话');
-  });
-
-  const header = h(
-    'div',
-    { class: 'chat-head' },
-    h(
-      'div',
-      { class: 'chat-head-left' },
-      h('div', { class: 'chat-title' }, 'AI 对话'),
-      h('div', { class: 'chat-sub' }, '内置 pi Agent · 能读写文件、跑命令、直接出卷')
-    ),
-    h(
-      'div',
-      { class: 'chat-head-right' },
-      profileSelect,
-      modelSelect,
-      newChatBtn,
-      h('button', { class: 'btn subtle', type: 'button', onclick: () => go('settings') }, '设置')
-    )
-  );
-
-  /* ---------------- 输入 ---------------- */
-
-  const input = h('textarea', {
-    class: 'input chat-input',
-    rows: '3',
-    placeholder: '想说点什么？比如「帮我出一套高一语文现代文阅读卷，放到放题目录」或「讲讲这道题为什么错」'
-  });
-
-  const sendBtn = h('button', { class: 'btn primary chat-send', type: 'button' }, '发送');
-
-  function setBusy(v) {
-    busy = v;
-    if (v) {
-      sendBtn.textContent = '停止';
-      sendBtn.className = 'btn danger chat-send';
-    } else {
-      sendBtn.textContent = '发送';
-      sendBtn.className = 'btn primary chat-send';
-    }
-  }
-
-  async function stop() {
-    if (!runId) return;
-    sendBtn.textContent = '停止中…';
-    sendBtn.disabled = true;
-    try {
-      await call('ai:cancel', { runId });
-    } catch {
-      /* ignore */
-    }
-  }
-
-  async function send() {
-    const text = input.value.trim();
-    if (!text || busy) return;
-    input.value = '';
-    pinned = true;
-    history.push({ role: 'user', text });
-    bubble('user', text);
-
-    aiBody = null;
-    aiBuffer = '';
-    bubbleWrap = null;
-    toolStack = null;
-    toolCards = new Map();
-    typing = null;
-
-    runId = uid('run');
-    setBusy(true);
-    const b = startAiBubble();
-
-    try {
-      const res = await call('agent:chat', { message: text, model: modelSelect.value || '', runId });
-      finishAi(res && res.text ? res.text : aiBuffer);
-      history.push({ role: 'ai', text: res && res.text ? res.text : aiBuffer, tools: [] });
-    } catch (err) {
-      clearTyping();
-      settleTools(true);
-      const msg = String((err && err.message) || err);
-      const stopped = /取消|中止|停止/.test(msg);
-      aiBody.appendChild(h('div', { class: stopped ? 'chat-note' : 'chat-error' }, stopped ? '已停止本次回答。' : msg));
-      history.push({ role: 'ai', text: `${stopped ? '（已停止）' : '（出错）'}${msg}` });
-    } finally {
-      runId = '';
-      setBusy(false);
-      input.focus();
-      requestAnimationFrame(() => scrollDown(pinned));
-    }
-  }
-
-  sendBtn.addEventListener('click', () => {
-    if (busy) stop();
-    else send();
-  });
-
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault();
-      if (!busy) send();
-    }
-  });
 
   function intro() {
     return h(
@@ -388,43 +87,343 @@ export async function renderChat(container, ctx) {
     );
   }
 
-  // 恢复本次进程内的对话
-  if (history.length) {
-    history.forEach((m) => {
-      const b = bubble(m.role, m.text);
-      if (m.role !== 'ai' || !m.tools || !m.tools.length) return;
-      const stack = h('div', { class: 'tool-stack' });
-      m.tools.forEach((t) => stack.appendChild(toolCard(t)));
-      b.node.querySelector('.chat-bubble').insertBefore(stack, b.body);
+  /* ---------------- 会话列表 ---------------- */
+
+  const convList = h('div', { class: 'conv-list' });
+
+  function paintConversations() {
+    convList.innerHTML = '';
+    if (!conversations.length) {
+      convList.appendChild(h('div', { class: 'conv-empty' }, '还没有对话'));
+      return;
+    }
+    conversations.forEach((conv) => {
+      const active = conv.id === conversationId;
+      const row = h(
+        'div',
+        { class: `conv-row ${active ? 'active' : ''}` },
+        h(
+          'button',
+          { class: 'conv-main', type: 'button', onclick: () => switchConversation(conv.id) },
+          h('div', { class: 'conv-title' }, conv.title || '新对话'),
+          h('div', { class: 'conv-meta' }, `${conv.messageCount || 0} 条 · ${timeAgo(conv.updatedAt)}`),
+          conv.preview ? h('div', { class: 'conv-preview' }, conv.preview) : null
+        ),
+        h(
+          'div',
+          { class: 'conv-actions' },
+          h(
+            'button',
+            {
+              class: 'conv-icon',
+              type: 'button',
+              title: '重命名',
+              onclick: (event) => {
+                event.stopPropagation();
+                renameConversation(conv);
+              }
+            },
+            '✎'
+          ),
+          h(
+            'button',
+            {
+              class: 'conv-icon danger',
+              type: 'button',
+              title: '删除',
+              onclick: (event) => {
+                event.stopPropagation();
+                removeConversation(conv);
+              }
+            },
+            '×'
+          )
+        )
+      );
+      row.addEventListener('dblclick', () => renameConversation(conv));
+      convList.appendChild(row);
     });
-  } else {
-    log.appendChild(intro());
   }
+
+  async function refreshConversations() {
+    try {
+      const res = await call('agent:conversations');
+      conversations = res.conversations || [];
+    } catch {
+      conversations = [];
+    }
+    paintConversations();
+  }
+
+  async function switchConversation(id) {
+    if (busy) return toast('等这一轮结束再切换对话', 'error');
+    if (loadingConv || id === conversationId) return;
+    loadingConv = true;
+    try {
+      const res = await call('agent:conversation:get', { conversationId: id });
+      const conv = res.conversation;
+      conversationId = conv.id;
+      log.innerHTML = '';
+      (conv.messages || []).forEach((m) => bubble(m.role === 'assistant' ? 'ai' : 'user', m.text));
+      if (!(conv.messages || []).length) log.appendChild(intro());
+      paintConversations();
+      pinned = true;
+      scrollDown(true);
+      input.focus();
+    } catch (err) {
+      toast(err.message || '读取对话失败', 'error');
+    } finally {
+      loadingConv = false;
+    }
+  }
+
+  async function newConversation() {
+    if (busy) return toast('等这一轮结束再新开对话', 'error');
+    try {
+      const res = await call('agent:conversation:new');
+      conversationId = res.conversation.id;
+      log.innerHTML = '';
+      log.appendChild(intro());
+      await refreshConversations();
+      input.focus();
+    } catch (err) {
+      toast(err.message || '新建对话失败', 'error');
+    }
+  }
+
+  function renameConversation(conv) {
+    const field = h('input', { class: 'input', type: 'text', value: conv.title || '' });
+    const ref = modal({
+      title: '重命名对话',
+      size: 'narrow',
+      body: field,
+      footer: [
+        h('button', { class: 'btn', type: 'button', onclick: () => ref.close() }, '取消'),
+        h(
+          'button',
+          {
+            class: 'btn primary',
+            type: 'button',
+            onclick: async () => {
+              const title = field.value.trim();
+              if (!title) return toast('标题不能为空', 'error');
+              try {
+                await call('agent:conversation:rename', { conversationId: conv.id, title });
+                ref.close();
+                await refreshConversations();
+              } catch (err) {
+                toast(err.message || '重命名失败', 'error');
+              }
+            }
+          },
+          '保存'
+        )
+      ]
+    });
+    setTimeout(() => field.focus(), 40);
+  }
+
+  async function removeConversation(conv) {
+    const ok = await confirmDialog({
+      title: '删除对话',
+      message: `「${conv.title || '新对话'}」的聊天记录会被删除，无法恢复。`,
+      confirmText: '删除',
+      danger: true
+    });
+    if (!ok) return;
+    try {
+      await call('agent:conversation:delete', { conversationId: conv.id });
+      if (conversationId === conv.id) {
+        conversationId = '';
+        log.innerHTML = '';
+        log.appendChild(intro());
+      }
+      await refreshConversations();
+      if (!conversationId && conversations.length) await switchConversation(conversations[0].id);
+    } catch (err) {
+      toast(err.message || '删除失败', 'error');
+    }
+  }
+
+  const newChatBtn = h('button', { class: 'btn primary conv-new', type: 'button', onclick: newConversation }, '＋ 新对话');
+
+  const side = h(
+    'aside',
+    { class: 'chat-side' },
+    h('div', { class: 'chat-side-head' }, h('div', { class: 'chat-side-title' }, '对话'), newChatBtn),
+    convList,
+    h(
+      'div',
+      { class: 'chat-side-foot' },
+      h('button', { class: 'btn subtle sm', type: 'button', onclick: () => go('settings') }, '设置'),
+      h('button', { class: 'btn subtle sm', type: 'button', onclick: () => go('home') }, '返回学习')
+    )
+  );
+
+  /* ---------------- 顶部 ---------------- */
+
+  const THINK_LEVELS = [
+    ['off', '思考 关'],
+    ['low', '思考 低'],
+    ['medium', '思考 中'],
+    ['high', '思考 高']
+  ];
+  const thinkSelect = h(
+    'select',
+    { class: 'select think-select', title: '本轮思考强度（模型支持时生效）' },
+    THINK_LEVELS.map(([value, label]) => h('option', { value, selected: value === ((state.settings && state.settings.thinkingLevel) || 'medium') }, label))
+  );
+
+  const profileSelect = h(
+    'select',
+    { class: 'select chat-model' },
+    profiles.length
+      ? profiles.map((p) => h('option', { value: p.id, selected: p.id === activeProfile }, p.name || p.model))
+      : h('option', { value: '' }, '未配置接口')
+  );
+  profileSelect.addEventListener('change', async () => {
+    if (busy) {
+      profileSelect.value = activeProfile;
+      return toast('等这一轮结束再切换接口', 'error');
+    }
+    try {
+      const res = await call('provider:activate', { id: profileSelect.value });
+      profiles = res.profiles;
+      activeProfile = res.activeProfileId;
+      if (state.boot) {
+        state.boot.providers = profiles;
+        state.boot.activeProfileId = activeProfile;
+      }
+      const active = profiles.find((p) => p.id === activeProfile);
+      toast(active ? `已切换到 ${active.name} · ${active.model}` : '已切换接口');
+    } catch (err) {
+      toast(err.message || '切换失败', 'error');
+    }
+  });
+
+  const header = h(
+    'div',
+    { class: 'chat-head' },
+    h(
+      'div',
+      { class: 'chat-head-left' },
+      h('div', { class: 'chat-title' }, 'AI 对话'),
+      h('div', { class: 'chat-sub' }, '内置 pi Agent · 能读写文件、跑命令、直接出卷')
+    ),
+    h('div', { class: 'chat-head-right' }, thinkSelect, profileSelect)
+  );
+
+  /* ---------------- 输入 ---------------- */
+
+  const input = h('textarea', {
+    class: 'input chat-input',
+    rows: '3',
+    placeholder: '想说点什么？比如「帮我出一套高一语文现代文阅读卷，放到放题目录」或「讲讲这道题为什么错」'
+  });
+
+  const sendBtn = h('button', { class: 'btn primary chat-send', type: 'button' }, '发送');
+  const stopBtn = h('button', { class: 'btn danger chat-stop', type: 'button' }, '停止');
+  stopBtn.style.display = 'none';
+
+  function setBusy(v) {
+    busy = v;
+    sendBtn.style.display = v ? 'none' : '';
+    stopBtn.style.display = v ? '' : 'none';
+    input.disabled = v;
+  }
+
+  async function stop() {
+    if (!runId) return;
+    stopBtn.textContent = '停止中…';
+    stopBtn.disabled = true;
+    try {
+      await call('ai:cancel', { runId });
+    } catch {
+      /* ignore */
+    }
+    // 兜底：后端长时间未返回时也要恢复可输入状态
+    setTimeout(() => {
+      if (!busy) return;
+      if (flow) flow.finish({ aborted: true });
+      runId = '';
+      setBusy(false);
+    }, 6000);
+  }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text || busy) return;
+    input.value = '';
+    pinned = true;
+    bubble('user', text);
+    flow = createAgentFlow(log, { modelLabel: modelLabel(), onUpdate: () => scrollDown() });
+
+    runId = uid('run');
+    setBusy(true);
+    stopBtn.textContent = '停止';
+    stopBtn.disabled = false;
+
+    try {
+      const res = await call('agent:chat', { message: text, runId, conversationId, thinking: thinkSelect.value });
+      if (res && res.conversationId) conversationId = res.conversationId;
+      if (res && res.text) flow.final(res.text, !!res.error && /abort|cancel|取消|中止|停止/i.test(res.error));
+      else if (res && res.error && !/abort|cancel|取消|中止|停止/i.test(res.error)) flow.finish({ aborted: false, error: res.error });
+      else flow.finish({ aborted: !!(res && res.error) });
+      await refreshConversations();
+    } catch (err) {
+      const msg = String((err && err.message) || err);
+      const stopped = /abort|cancel|取消|中止|停止/i.test(msg);
+      if (flow) flow.finish({ aborted: stopped, error: stopped ? '' : msg });
+      if (!stopped) toast(msg, 'error');
+      await refreshConversations();
+    } finally {
+      runId = '';
+      setBusy(false);
+      flow = null;
+      input.focus();
+      requestAnimationFrame(() => scrollDown(pinned));
+    }
+  }
+
+  sendBtn.addEventListener('click', send);
+  stopBtn.addEventListener('click', stop);
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      if (!busy) send();
+    }
+  });
 
   const composer = h(
     'div',
     { class: 'chat-composer' },
     input,
-    h('div', { class: 'chat-composer-side' }, sendBtn, h('div', { class: 'hint' }, 'Enter 发送 · Shift+Enter 换行'))
+    h('div', { class: 'chat-composer-side' }, sendBtn, stopBtn, h('div', { class: 'hint' }, '⌘/Ctrl + Enter 发送 · Enter 换行'))
   );
 
-  const page = h('div', { class: 'chat-page' }, header, scroller, composer);
+  const main = h('section', { class: 'chat-main' }, header, scroller, composer);
+  const page = h('div', { class: 'chat-page with-side' }, side, main);
   container.appendChild(page);
+
+  // 加载会话
+  await refreshConversations();
+  if (conversations.length) {
+    await switchConversation(conversations[0].id);
+  } else {
+    log.appendChild(intro());
+  }
   input.focus();
-  loadModels();
 
   const off = onAiEvent((ev) => {
     if (!ev || ev.scope !== 'agent' || (runId && ev.runId && ev.runId !== runId)) return;
-    if (ev.type === 'text') paintAi(ev.full != null ? ev.full : ev.text);
-    else if (ev.type === 'tool') upsertTool(ev);
-    else if (ev.type === 'done') settleTools(false);
-    else if (ev.type === 'failed') settleTools(true);
-    else if (ev.type === 'error' && ev.error) {
-      clearTyping();
-      settleTools(true);
-      if (aiBody) aiBody.appendChild(h('div', { class: 'chat-error' }, ev.error));
-      else toast(ev.error, 'error');
-    }
+    if (!flow) return;
+    if (ev.type === 'text') flow.text(ev.full != null ? ev.full : ev.text);
+    else if (ev.type === 'thinking') flow.thinking(ev.full != null ? ev.full : ev.text);
+    else if (ev.type === 'thinking_end') flow.thinkingEnd();
+    else if (ev.type === 'tool') flow.tool(ev);
+    else if (ev.type === 'failed') flow.finish({ aborted: false, error: ev.error || '' });
+    else if (ev.type === 'error' && ev.error) flow.note(`错误：${ev.error}`, 'flow-error');
   });
 
   return () => {

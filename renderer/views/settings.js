@@ -12,7 +12,6 @@ export async function renderSettings(container, ctx) {
   let settingsDraft = Object.assign({}, settings);
   let profiles = data.profiles || [];
   let activeProfileId = data.activeProfileId || '';
-  let models = [];
 
   state.settings = settings;
 
@@ -150,7 +149,6 @@ export async function renderSettings(container, ctx) {
     });
     const modelInput = h('input', { class: 'input', type: 'text', placeholder: 'deepseek-chat', value: draft.model || '' });
     const ctxInput = h('input', { class: 'input', type: 'number', value: String(draft.contextWindow || 128000) });
-    const maxInput = h('input', { class: 'input', type: 'number', value: String(draft.maxTokens || 8192) });
 
     const ref = modal({
       title: profile ? '编辑接口' : '添加接口',
@@ -170,9 +168,10 @@ export async function renderSettings(container, ctx) {
         h('div', { class: 'field' }, h('span', { class: 'label' }, '模型名'), modelInput),
         h(
           'div',
-          { class: 'row' },
-          h('div', { class: 'field', style: 'flex:1' }, h('span', { class: 'label' }, '上下文长度'), ctxInput),
-          h('div', { class: 'field', style: 'flex:1' }, h('span', { class: 'label' }, '最大输出 tokens'), maxInput)
+          { class: 'field' },
+          h('span', { class: 'label' }, '上下文长度'),
+          ctxInput,
+          h('div', { class: 'hint' }, '输出不设额外上限，由模型自身的能力决定。')
         )
       ),
       footer: [
@@ -194,7 +193,7 @@ export async function renderSettings(container, ctx) {
                   apiKey: keyInput.value.trim(),
                   model: modelInput.value.trim(),
                   contextWindow: Number(ctxInput.value) || 128000,
-                  maxTokens: Number(maxInput.value) || 8192
+                  maxTokens: 0
                 });
                 profiles = res.profiles;
                 activeProfileId = res.activeProfileId;
@@ -234,36 +233,6 @@ export async function renderSettings(container, ctx) {
 
   /* ---------- 学习偏好 ---------- */
 
-  const modelSelectEl = h('select', { class: 'select' });
-  function fillModelSelect() {
-    modelSelectEl.innerHTML = '';
-    const ids = models.map((m) => m.id);
-    const current = settingsDraft.defaultModel || '';
-    if (!ids.includes(current)) {
-      modelSelectEl.appendChild(
-        h('option', { value: current }, current ? `${current}（当前）` : '跟随接口配置')
-      );
-    } else {
-      modelSelectEl.appendChild(h('option', { value: '' }, '跟随接口配置'));
-    }
-    models.forEach((m) => modelSelectEl.appendChild(h('option', { value: m.id }, m.name || m.id)));
-    modelSelectEl.value = ids.includes(current) ? current : current;
-  }
-
-  const modelCount = h('span', { class: 'hint' }, '可从当前接口读取模型列表');
-
-  async function loadModels() {
-    try {
-      const res = await call('provider:models', {});
-      models = res.models || [];
-      modelCount.textContent = models.length ? `已载入 ${models.length} 个模型` : '接口没有返回模型列表，可直接手填模型名';
-    } catch (err) {
-      models = [];
-      modelCount.textContent = err.message || '读取模型失败';
-    }
-    fillModelSelect();
-  }
-
   const exportInput = h('input', { class: 'input', type: 'text', value: settingsDraft.exportDir || '' });
   const timeoutInput = h('input', {
     class: 'input',
@@ -272,6 +241,7 @@ export async function renderSettings(container, ctx) {
     step: '10',
     value: String(Math.round((settingsDraft.timeoutMs || 180000) / 1000))
   });
+  const welcomeInput = h('input', { class: 'input', type: 'text', value: settingsDraft.searchCmd || '', placeholder: 'agent-search "{{query}}" --json' });
   const autoChoice = h('input', { type: 'checkbox', checked: settingsDraft.autoGradeChoice !== false });
 
   async function saveSettings(patch, message = '设置已保存') {
@@ -279,7 +249,6 @@ export async function renderSettings(container, ctx) {
     settings = res.settings;
     settingsDraft = Object.assign({}, settings);
     state.settings = settings;
-    fillModelSelect();
     toast(message, 'ok');
   }
 
@@ -287,14 +256,7 @@ export async function renderSettings(container, ctx) {
     'div',
     { class: 'settings-card' },
     h('h3', {}, '学习偏好'),
-    h('div', { class: 'desc' }, '默认模型、AI 超时时间，以及生成的试卷存放位置。'),
-    h(
-      'div',
-      { class: 'field' },
-      h('span', { class: 'label' }, '默认模型'),
-      modelSelectEl,
-      h('div', { class: 'row', style: 'margin-top:8px' }, modelCount, h('button', { class: 'btn subtle sm', type: 'button', onclick: loadModels }, '读取模型'))
-    ),
+    h('div', { class: 'desc' }, '模型统一由上方「API 接口」决定，所有批改、讲解、对话都使用当前启用的接口。这里配置超时、载体存放位置与可选的搜索命令。'),
     h(
       'div',
       { class: 'field' },
@@ -316,7 +278,14 @@ export async function renderSettings(container, ctx) {
           '选择'
         )
       ),
-      h('div', { class: 'hint' }, 'AI 出卷与导入的试卷都会写到这里（按学科分子文件夹），启动时自动收录。')
+      h('div', { class: 'hint' }, 'AI 出卷与导入的载体都会写到这里（按学科分子文件夹），启动时自动收录。')
+    ),
+    h(
+      'div',
+      { class: 'field' },
+      h('span', { class: 'label' }, '联网搜索命令（可选）'),
+      welcomeInput,
+      h('div', { class: 'hint' }, '默认使用内置 Aggr Search（多引擎聚合），无需填写。只有想换成别的命令行工具时才填，{{query}} 会替换成关键词。')
     ),
     h(
       'div',
@@ -325,21 +294,25 @@ export async function renderSettings(container, ctx) {
       timeoutInput,
       h('div', { class: 'hint' }, '单次请求的最长等待时间，超过后会自动中止。')
     ),
-    h('label', { class: 'switch', style: 'margin-bottom:16px' }, autoChoice, '客观选择题由本地直接判定'),
     h(
-      'button',
-      {
-        class: 'btn primary',
-        type: 'button',
-        onclick: () =>
-          saveSettings({
-            defaultModel: modelSelectEl.value,
-            exportDir: exportInput.value.trim(),
-            timeoutMs: Math.round(Number(timeoutInput.value || 180) * 1000),
-            autoGradeChoice: autoChoice.checked
-          })
-      },
-      '保存'
+      'div',
+      { class: 'settings-actions' },
+      h('label', { class: 'switch' }, autoChoice, '客观选择题由本地直接判定'),
+      h(
+        'button',
+        {
+          class: 'btn primary',
+          type: 'button',
+          onclick: () =>
+            saveSettings({
+              exportDir: exportInput.value.trim(),
+              timeoutMs: Math.round(Number(timeoutInput.value || 180) * 1000),
+              autoGradeChoice: autoChoice.checked,
+              searchCmd: welcomeInput.value.trim()
+            })
+        },
+        '保存'
+      )
     )
   );
 
@@ -387,7 +360,7 @@ export async function renderSettings(container, ctx) {
     'div',
     { class: 'settings-card' },
     h('h3', {}, '数据与放题目录'),
-    h('div', { class: 'desc' }, '所有数据都保存在本机。把试卷 JSON 放进「放题目录」，应用每次打开会自动收录。'),
+    h('div', { class: 'desc' }, '所有数据都保存在本机。把载体 JSON 放进「放题目录」，应用每次打开会自动收录。'),
     h('div', { class: 'kv' }, h('span', {}, '数据目录'), h('b', {}, state.boot.dataRoot || '')),
     h('div', { class: 'kv' }, h('span', {}, '放题目录'), h('b', {}, settingsDraft.exportDir || '')),
     h('div', { class: 'kv' }, h('span', {}, '版本'), h('b', {}, `v${state.boot.version || '1.0.0'}`)),
@@ -401,8 +374,8 @@ export async function renderSettings(container, ctx) {
           type: 'button',
           onclick: async () => {
             try {
-              const res = await call('paper:syncFolder', { dir: settingsDraft.exportDir || '' });
-              toast(res.added ? `已收录 ${res.added} 套新试卷` : `已扫描 ${res.scanned} 个文件，没有新试卷`, res.added ? 'ok' : '');
+              const res = await call('carrier:syncFolder', { dir: settingsDraft.exportDir || '' });
+              toast(res.added ? `已收录 ${res.added} 个新载体` : `已扫描 ${res.scanned} 个文件，没有新内容`, res.added ? 'ok' : '');
             } catch (err) {
               toast(err.message || '同步失败', 'error');
             }
@@ -414,11 +387,8 @@ export async function renderSettings(container, ctx) {
   );
 
   paintProfiles();
-  fillModelSelect();
 
   grid.append(apiCard, prefCard, promptCard, dataCard);
   page.appendChild(grid);
   container.appendChild(page);
-
-  if (activeProfileId) loadModels();
 }

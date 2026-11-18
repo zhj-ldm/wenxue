@@ -1,11 +1,10 @@
 import { call } from './api.js';
 import { h, toast, modal } from './ui.js';
 import { renderHome } from './views/home.js';
-import { renderLibrary } from './views/library.js';
-import { renderExam } from './views/exam.js';
 import { renderHistory } from './views/history.js';
 import { renderSettings } from './views/settings.js';
 import { renderChat } from './views/chat.js';
+import { renderCarrier } from './views/carrier.js';
 
 export const state = {
   boot: null,
@@ -23,9 +22,7 @@ let booted = false;
 function topbar(route) {
   const nav = [
     { key: 'home', label: '学习' },
-    { key: 'chat', label: '对话' },
-    { key: 'history', label: '记录' },
-    { key: 'settings', label: '设置' }
+    { key: 'chat', label: '对话' }
   ];
 
   const bar = h(
@@ -39,7 +36,7 @@ function topbar(route) {
         'div',
         {},
         h('div', { class: 'brand-name' }, '问学'),
-        h('div', { class: 'brand-sub' }, 'AI 试卷练习')
+        h('div', { class: 'brand-sub' }, 'AI 学伴')
       )
     ),
     h(
@@ -49,7 +46,7 @@ function topbar(route) {
         h(
           'button',
           {
-            class: `nav-btn ${route === item.key ? 'active' : ''}`,
+            class: `nav-btn ${(route === 'carrier' ? 'home' : route) === item.key ? 'active' : ''}`,
             type: 'button',
             onclick: () => go(item.key)
           },
@@ -60,6 +57,8 @@ function topbar(route) {
     h(
       'div',
       { class: 'topbar-right' },
+      h('button', { class: 'icon-btn', type: 'button', title: '作答记录', onclick: () => go('history') }, '记录'),
+      h('button', { class: 'icon-btn', type: 'button', title: '设置', onclick: () => go('settings') }, '设置'),
       h(
         'div',
         { class: 'user-chip', onclick: openFolderInfo, title: '放题目录与数据位置' },
@@ -102,10 +101,10 @@ function openFolderInfo() {
           class: 'btn',
           type: 'button',
           onclick: async () => {
-            const res = await call('paper:syncFolder', {});
-            toast(res.added ? `已同步 ${res.added} 套新试卷` : '没有发现新试卷', res.added ? 'ok' : '');
+            const res = await call('carrier:syncFolder', {});
+            toast(res.added ? `已同步 ${res.added} 个新载体` : '没有发现新内容', res.added ? 'ok' : '');
             ref.close();
-            go(state.route === 'exam' ? 'library' : state.route || 'home');
+            go(state.route === 'carrier' ? 'home' : state.route || 'home');
           }
         },
         '同步放题文件夹'
@@ -129,8 +128,13 @@ export async function go(route, params = {}) {
   state.params = params || {};
   root.innerHTML = '';
 
-  if (route === 'exam') {
-    const cleanup = await renderExam(root, { go, state, params: state.params });
+  if (route === 'carrier') {
+    const view = h('div', { class: 'layout' });
+    const content = h('div', { class: 'content carrier-shell' });
+    view.appendChild(topbar(route));
+    view.appendChild(content);
+    root.appendChild(view);
+    const cleanup = await renderCarrier(content, { go, state, params: state.params });
     state.cleanup = cleanup || null;
     return;
   }
@@ -143,7 +147,6 @@ export async function go(route, params = {}) {
 
   const renderers = {
     home: renderHome,
-    library: renderLibrary,
     chat: renderChat,
     history: renderHistory,
     settings: renderSettings
@@ -163,7 +166,7 @@ export async function go(route, params = {}) {
           h('div', { class: 'icon' }, '!'),
           h('div', { class: 'empty-title' }, '页面加载失败'),
           h('div', { class: 'empty-desc' }, err.message || String(err)),
-          h('button', { class: 'btn', type: 'button', onclick: () => go('home') }, 'Back to Home')
+          h('button', { class: 'btn', type: 'button', onclick: () => go('home') }, '返回首页')
         )
       )
     );
@@ -178,10 +181,11 @@ async function boot() {
     const data = await call('app:bootstrap');
     state.boot = data;
     state.user = data.user;
+    document.body.dataset.platform = data.platform || '';
     root.innerHTML = '';
     state.settings = (await call('settings:get')).settings;
     if (data.folderSync && data.folderSync.added) {
-      toast(`已从放题文件夹收录 ${data.folderSync.added} 套新试卷`, 'ok');
+      toast(`已从放题目录收录 ${data.folderSync.added} 个新载体`, 'ok');
     }
     go('home', { welcome: true });
   } catch (err) {

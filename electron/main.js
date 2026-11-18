@@ -3,13 +3,13 @@
 const path = require('path');
 const fs = require('fs');
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { exec, execFile } = require('child_process');
 
 const store = require('./lib/store');
 const pi = require('./lib/pi');
 const papersLib = require('./lib/papers');
 const ai = require('./lib/ai');
 const prompts = require('./lib/prompts');
-const { localGrade, parseJsonLoose } = require('./lib/grader');
 
 let mainWindow = null;
 
@@ -41,16 +41,12 @@ function activeProfile() {
   return store.activeProfile();
 }
 
-// 只接受干净的模型名字符串；历史脏数据（对象、OpenCode 模型）一律丢弃
-function cleanModelName(value) {
-  const id = typeof value === 'string' ? value.trim() : '';
-  if (!id || id === '[object Object]' || /opencode|big-pickle/i.test(id)) return '';
-  return id;
+function modelOf(profile) {
+  return String((profile && profile.model) || '').trim();
 }
 
-function modelOf(profile, model) {
-  return cleanModelName(model) || profile.model;
-}
+// 所有 AI 调用共用的取消表（纯文本补全走这里，Agent 走 pi.cancel）
+const textRuns = new Map();
 
 function findQuestion(paper, questionId) {
   const idx = paper.questions.findIndex((q) => q.id === questionId);
@@ -67,22 +63,28 @@ async function runAi(options) {
   const settings = settingsOf(requireUser().id);
   const runId = options.runId || store.rid('run');
   const timeoutMs = Math.min(600000, Math.max(30000, Number(options.timeoutMs || settings.timeoutMs || 180000)));
+  const controller = new AbortController();
+  textRuns.set(runId, controller);
 
   emit({ runId, ...options.meta, type: 'start' });
   try {
     const result = await pi.completeText({
       profile,
-      model: modelOf(profile, options.model),
+      model: modelOf(profile),
       systemPrompt: options.systemPrompt || '',
       messages: messages || [{ role: 'user', content: prompt, timestamp: Date.now() }],
-      timeoutMs
+      thinkingLevel: options.thinking || settingsOf(requireUser().id).thinkingLevel || 'off',
+      timeoutMs,
+      signal: controller.signal
     });
     emit({ runId, ...options.meta, type: 'done', text: result.text, error: result.error || '' });
     return { runId, ok: !result.error, text: result.text, error: result.error || '', tools: [] };
   } catch (err) {
-    const message = err && err.message ? err.message : String(err);
+    const message = controller.signal.aborted ? '已停止' : err && err.message ? err.message : String(err);
     emit({ runId, ...options.meta, type: 'failed', error: message });
-    throw err;
+    throw new Error(message);
+  } finally {
+    textRuns.delete(runId);
   }
 }
 
@@ -90,7 +92,7 @@ async function runAi(options) {
 /* ---------------- 启动 / 全局 ---------------- */
 
 handle('app:bootstrap', async () => {
-  const folder = store.syncPaperFolder(store.localUser().id);
+  const folder = store.syncCarrierFolder(store.localUser().id);
   const providers = store.publicProfiles();
   return {
     user: store.localUser(),
@@ -176,52 +178,13 @@ handle('app:openExternal', async ({ url }) => {
   return true;
 });
 
-/* ---------------- 试卷 ---------------- */
+/* ---------------- 放题目录同步 ---------------- */
 
-handle('paper:list', async () => {
-  const user = requireUser();
-  store.syncPaperFolder(user.id);
-  return store.listPapers(user.id);
-});
-
-// 手动「从放题文件夹同步」：强制重新扫描，返回新增明细
-handle('paper:syncFolder', async ({ dir } = {}) => {
+// 手动「从放题目录同步」：强制重新扫描，返回新增明细
+handle('carrier:syncFolder', async ({ dir } = {}) => {
   const user = requireUser();
   if (dir) store.saveUserSettings(user.id, { exportDir: dir });
-  const res = store.syncPaperFolder(user.id, { force: true });
-  return res;
-});
-
-handle('paper:get', async ({ paperId }) => {
-  const user = requireUser();
-  return store.getPaper(user.id, paperId);
-});
-
-handle('paper:delete', async ({ paperId }) => {
-  const user = requireUser();
-  return store.deletePaper(user.id, paperId);
-});
-
-handle('paper:export', async ({ paperId, dir }) => {
-  const user = requireUser();
-  const settings = settingsOf(user.id);
-  return { file: store.exportPaper(user.id, paperId, dir || settings.exportDir) };
-});
-
-handle('paper:import', async ({ raw, subject, grade }) => {
-  const user = requireUser();
-  const uid = user.id;
-  const parsed = parseJsonLoose(raw);
-  if (!parsed.ok) throw new Error('这不是合法的 JSON。请选择应用导出的试卷 JSON 文件（*.json）。');
-  const paper = papersLib.normalizePaper(parsed.value, { subject, grade, source: 'imported' });
-  store.savePaper(uid, paper, papersLib.summary(paper));
-  let file = '';
-  try {
-    file = store.exportPaper(uid, paper.id, settingsOf(uid).exportDir);
-  } catch {
-    /* 导出失败不影响入库 */
-  }
-  return { paper, file };
+  return store.syncCarrierFolder(user.id, { force: true });
 });
 
 /* ---------------- 全局 AI 对话（内置 pi Agent） ---------------- */
@@ -229,31 +192,251 @@ handle('paper:import', async ({ raw, subject, grade }) => {
 function agentContext(uid) {
   const settings = settingsOf(uid);
   return [
-    '你是「问学」桌面应用内嵌的学习助手，运行在用户本机，可以直接读写文件、运行命令、使用工具。',
-    `放题目录（用户放试卷的地方）：${settings.exportDir}`,
-    '生成试卷时：写成一个 .json 文件放进放题目录的学科子文件夹（如 语文/、数学/），应用会自动收录。格式必须是：',
-    '{"title","subject","grade","difficulty","totalScore","durationMinutes","instructions","sections":[{"name","passage","questions":[{"id","type","stem","passage","options","maxScore","referenceAnswer","rubric":[{"point","score"}],"knowledgePoints","difficulty"}]}]}',
-    '其中 type 取 choice / multi_choice / fill_blank / short_answer / essay / translation / calculation / other；共用阅读材料只放在 section.passage，小题 passage 留空；totalScore 等于各小题 maxScore 之和。',
-    '用户可能让你讲题、出卷、整理错题、制定学习计划、修改本地文件。按需调用工具把事做完，不要只说方案。',
-    '回答用中文，简洁直接；改动了文件就说清路径。'
+    '你是「问学」桌面应用内嵌的学习助手，运行在用户本机，可以读写文件、运行命令、使用工具。',
+    `今天是 ${store.todayStr()}。放题目录：${settings.exportDir}`,
+    '你拥有以下能力，用户让你做时直接调用工具把事情做完，不要只给方案：',
+    '1. 学习内容统一为「载体」，分三种：paper（整套试卷）、practice（专项练习）、plan（提升计划）。',
+    '   只能用 create_carrier / update_carrier / find_carrier / list_carriers / delete_carrier 工具创建和修改，不要手写文件。',
+    '   每个载体自动生成 8 位编号（如 A7K2M9Q1），用户可以用编号找你检索；回复时提到载体要带上编号。',
+    '2. 载体结构：{kind,title,subject,grade,goal,instructions,durationMinutes,sections:[{name,passage,date,questions:[...]}]}。',
+    '   题目字段：{id,type,layout,stem,passage,blanks,options,maxScore,referenceAnswer,rubric,knowledgePoints,difficulty,date,answerMode,actions}。',
+    '   date 写 YYYY-MM-DD：大题写 date，小题自动继承；小题也可单独写 date。到期（当天或已过期未做）会自动出现在「每日任务」。',
+    '   actions 控制题目按钮：{"grade":true,"explain":true,"chat":true}，false 则不显示对应按钮。',
+    '   answerMode 取 fixed（有标准答案）或 open（答案不唯一，不设标准答案，由你判分）。',
+    '3. 填空题（语篇填空、语法填空、默写）默认内联：layout 写 "inline"，在 passage 或 stem 里用 {{1}}、{{2}} 标出空位，blanks 给出每个空的 key/answer/maxScore。示例：',
+    '   {"id":"q1","type":"fill_blank","layout":"inline","stem":"The Great Wall {{1}} (build) long ago, and it {{2}} (visit) by many people every year.","blanks":[{"key":"1","answer":"was built","maxScore":1},{"key":"2","answer":"is visited","maxScore":1}],"maxScore":2,"referenceAnswer":"1. was built  2. is visited","rubric":[{"point":"时态与语态","score":2}]}',
+    '   普通问答题用 block（不写 layout 即可），不要把一个空拆成一道小题。',
+    '4. 用户说「帮我做一个两周的英语补全对话提升计划」时，用 create_carrier（kind=plan），把每天做成一个 section 并写 date，题目放该 section 内。',
+    '5. 讲题、整理错题、调整计划、修改本地文件都可以直接做；用 list_carriers / find_carrier 了解已有内容和完成情况。',
+    '6. 需要最新资料、时事或题目素材时，用 web_search 联网搜索；搜到链接后可以用 web_fetch 读取网页正文。',
+    'type 取 choice / multi_choice / fill_blank / short_answer / essay / translation / calculation / other；总分等于各小题 maxScore 之和。',
+    '模型由用户在设置里配置，不要询问或声称切换模型。回答用中文，简洁直接；创建或改动了载体要告诉用户编号和结果。'
   ].join('\n');
 }
 
-handle('agent:chat', async ({ message, model, reset, runId } = {}) => {
+// 联网搜索：默认调用内置 Aggr Search（bin/aggrsearch），也可在设置里用自定义命令覆盖
+const SEARCH_BIN_NAME = process.platform === 'win32' ? 'aggrsearch.exe' : 'aggrsearch';
+
+function searchBinCandidates() {
+  const list = [];
+  if (process.resourcesPath) list.push(path.join(process.resourcesPath, 'bin', SEARCH_BIN_NAME));
+  list.push(path.join(__dirname, '..', 'bin', SEARCH_BIN_NAME));
+  list.push(path.join(app.getAppPath(), 'bin', SEARCH_BIN_NAME));
+  return list;
+}
+
+function resolveSearchBin() {
+  for (const p of searchBinCandidates()) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {
+      /* ignore */
+    }
+  }
+  return '';
+}
+
+function execSearchBin(args, timeout = 45000) {
+  const bin = resolveSearchBin();
+  if (!bin) {
+    return Promise.reject(
+      new Error(`没有找到内置搜索工具（${SEARCH_BIN_NAME}），请把对应平台的 Aggr Search 放到应用的 bin/ 目录，或在「设置 → 联网搜索命令」里填写自定义命令。`)
+    );
+  }
+  return new Promise((resolve, reject) => {
+    execFile(bin, args, { timeout, maxBuffer: 8 * 1024 * 1024, env: process.env }, (err, stdout, stderr) => {
+      const out = String(stdout || '').trim();
+      if (err && !out) {
+        reject(new Error(`搜索失败：${String(stderr || err.message || '').slice(0, 300)}`));
+        return;
+      }
+      resolve(out);
+    });
+  });
+}
+
+async function webSearch(uid, { query, count, max } = {}) {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('搜索关键词为空');
+  const limit = Math.min(Math.max(Number(count || max) || 6, 1), 20);
+  const template = String(settingsOf(uid).searchCmd || '').trim();
+
+  // 用户自定义命令优先
+  if (template) {
+    const safe = q.replace(/["`$\\]/g, '\\$&');
+    const cmd = template.includes('{{query}}') ? template.replace(/\{\{query\}\}/g, safe) : `${template} "${safe}"`;
+    const out = await new Promise((resolve, reject) => {
+      exec(cmd, { timeout: 45000, maxBuffer: 8 * 1024 * 1024, env: process.env }, (err, stdout, stderr) => {
+        const text = String(stdout || '').trim();
+        if (err && !text) {
+          reject(new Error(`搜索命令执行失败：${String(stderr || err.message || '').slice(0, 300)}`));
+          return;
+        }
+        resolve(text);
+      });
+    });
+    return out ? out.slice(0, 20000) : '没有搜索到结果。';
+  }
+
+  const raw = await execSearchBin(['search', q, '--max', String(limit), '--json']);
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return raw.slice(0, 20000) || '没有搜索到结果。';
+  }
+  const results = Array.isArray(data.results) ? data.results.slice(0, limit) : [];
+  if (!results.length) return `查询：${q}\n（没有搜索到结果）`;
+  const lines = results.map((r, i) => {
+    const snippet = String(r.snippet || r.content || '').replace(/\s+/g, ' ').slice(0, 260);
+    return `${i + 1}. ${r.title || '(无标题)'}\n   ${r.url || ''}\n   ${snippet}`;
+  });
+  return `查询：${q}\n${lines.join('\n')}`;
+}
+
+async function webFetch(uid, { url } = {}) {
+  const target = String(url || '').trim();
+  if (!target) throw new Error('网址为空');
+  const template = String(settingsOf(uid).searchCmd || '').trim();
+  if (template) {
+    const base = template.replace(/\{\{query\}\}/g, '{{url}}');
+    const safe = target.replace(/["`$\\]/g, '\\$&');
+    const cmd = base.includes('{{url}}') ? base.replace(/\{\{url\}\}/g, safe) : `${base} "${safe}"`;
+    const out = await new Promise((resolve, reject) => {
+      exec(cmd, { timeout: 60000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+        const text = String(stdout || '').trim();
+        if (err && !text) reject(new Error(`抓取失败：${String(stderr || err.message || '').slice(0, 300)}`));
+        else resolve(text);
+      });
+    });
+    return out.slice(0, 20000) || '没有抓到内容。';
+  }
+  const raw = await execSearchBin(['fetch', target, '--json'], 60000);
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return raw.slice(0, 20000);
+  }
+  if (data.error) throw new Error(`抓取失败：${data.error}`);
+  return `${target}\n\n${String(data.body || data.content || '').slice(0, 16000)}`;
+}
+
+// 暴露给 Agent 的计划 / 任务工具
+function addDays(dateStr, n) {
+  const d = new Date(`${dateStr}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return store.todayStr();
+  d.setDate(d.getDate() + n);
+  return store.todayStr(d);
+}
+
+function carrierHooks(uid) {
+  return {
+    webSearch: (params) => webSearch(uid, params),
+    webFetch: (params) => webFetch(uid, params),
+    createCarrier: async (params = {}) => {
+      const carrier = store.saveCarrier(uid, {
+        kind: params.kind,
+        title: String(params.title || '未命名载体').trim(),
+        subject: String(params.subject || '综合').trim(),
+        grade: String(params.grade || '').trim(),
+        goal: String(params.goal || '').trim(),
+        instructions: String(params.instructions || '').trim(),
+        durationMinutes: Number(params.durationMinutes) || 0,
+        sections: params.sections || []
+      });
+      const brief = store.listCarrierBriefs(uid).find((c) => c.code === carrier.code);
+      return { ok: true, code: carrier.code, title: carrier.title, kind: carrier.kind, questionCount: brief ? brief.questionCount : 0 };
+    },
+    updateCarrier: async ({ code, patch } = {}) => {
+      const exist = store.getCarrier(uid, String(code || ''));
+      const carrier = store.saveCarrier(uid, Object.assign({}, exist, patch || {}, { code: exist.code }));
+      return { ok: true, code: carrier.code, title: carrier.title };
+    },
+    findCarrier: async ({ code, title } = {}) => {
+      const list = store.listCarriers(uid);
+      const hit = code
+        ? list.find((c) => c.code === String(code).toUpperCase())
+        : list.find((c) => String(c.title).includes(String(title || '')));
+      if (!hit) throw new Error('没有找到对应载体');
+      const brief = store.listCarrierBriefs(uid).find((c) => c.code === hit.code);
+      return { carrier: hit, brief };
+    },
+    listCarriers: async ({ kind } = {}) => ({ carriers: store.listCarrierBriefs(uid, kind || '') }),
+    deleteCarrier: async ({ code } = {}) => ({ ok: store.deleteCarrier(uid, String(code || '')) })
+  };
+}
+
+function normalizeThinking(value, fallback = 'medium') {
+  const v = String(value || fallback || 'medium').toLowerCase();
+  return ['off', 'low', 'medium', 'high'].includes(v) ? v : 'medium';
+}
+
+// 已在本进程内建立过 Agent 会话的对话 id
+const liveConversations = new Set();
+
+handle('agent:conversations', async () => {
+  const uid = requireUser().id;
+  return { conversations: store.listConversationBriefs(uid) };
+});
+
+handle('agent:conversation:get', async ({ conversationId } = {}) => {
+  const uid = requireUser().id;
+  const conv = store.getConversation(uid, String(conversationId || ''));
+  return { conversation: conv };
+});
+
+handle('agent:conversation:new', async () => {
+  const uid = requireUser().id;
+  const conv = store.saveConversation(uid, { title: '新对话', messages: [] });
+  return { conversation: conv };
+});
+
+handle('agent:conversation:delete', async ({ conversationId } = {}) => {
+  const uid = requireUser().id;
+  const id = String(conversationId || '');
+  pi.resetSession(id);
+  liveConversations.delete(id);
+  return { ok: store.deleteConversation(uid, id) };
+});
+
+handle('agent:conversation:rename', async ({ conversationId, title } = {}) => {
+  const uid = requireUser().id;
+  const clean = String(title || '').trim().slice(0, 40);
+  if (!clean) throw new Error('标题不能为空');
+  const conv = store.saveConversation(uid, { id: String(conversationId || ''), title: clean });
+  return { conversation: conv };
+});
+
+handle('agent:chat', async ({ message, thinking, conversationId, runId } = {}) => {
   const uid = requireUser().id;
   const settings = settingsOf(uid);
-  if (reset) {
-    pi.resetSession(settings.agentSessionId);
-    store.saveUserSettings(uid, { agentSessionId: '' });
-    if (!String(message || '').trim()) return { text: '', sessionId: '', tools: [] };
-  }
   const text = String(message || '').trim();
   if (!text) throw new Error('请输入内容');
-  if (!settings.agentSessionId) {
-    const fresh = store.rid('sess');
-    store.saveUserSettings(uid, { agentSessionId: fresh });
+
+  let conv = null;
+  if (conversationId) {
+    try {
+      conv = store.getConversation(uid, String(conversationId));
+    } catch {
+      conv = null;
+    }
   }
-  const sessionId = settingsOf(uid).agentSessionId;
+  if (!conv) conv = store.saveConversation(uid, { title: text.replace(/\s+/g, ' ').slice(0, 24) });
+
+  const history = (conv.messages || []).filter((m) => m && String(m.text || '').trim());
+  const wasEmpty = !(conv.messages || []).some((m) => String(m.text || '').trim());
+  const resumed = liveConversations.has(conv.id);
+  const prompt = resumed
+    ? text
+    : history.length
+      ? `以下是之前的对话记录：\n${history
+          .slice(-20)
+          .map((m) => `${m.role === 'assistant' ? 'AI' : '用户'}：${String(m.text).slice(0, 500)}`)
+          .join('\n')}\n\n用户现在说：\n${text}`
+      : text;
+
+  store.appendConversationMessage(uid, conv.id, { role: 'user', text, ts: Date.now() });
 
   const profile = store.activeProfile();
   const run = runId || store.rid('run');
@@ -261,206 +444,262 @@ handle('agent:chat', async ({ message, model, reset, runId } = {}) => {
   const result = await pi.runAgent({
     runId: run,
     profile,
-    model: modelOf(profile, model || settings.defaultModel),
+    model: modelOf(profile),
     baseDir: settings.exportDir,
     systemPrompt: agentContext(uid),
-    prompt: text,
+    prompt,
+    sessionId: conv.id,
+    toolHooks: carrierHooks(uid),
+    thinkingLevel: normalizeThinking(thinking || settings.thinkingLevel),
     timeoutMs: settings.timeoutMs,
     onEvent: (event) => emit({ runId: run, scope: 'agent', ...event })
   });
+  liveConversations.add(conv.id);
   emit({ runId: run, scope: 'agent', type: result.error ? 'failed' : 'done', error: result.error || '', text: result.text });
-  if (result.error && !result.text) throw new Error(result.error);
-  return { text: result.text, sessionId, tools: result.tools || [] };
+  if (result.text) {
+    store.appendConversationMessage(uid, conv.id, { role: 'assistant', text: result.text, ts: Date.now() });
+  }
+  if (wasEmpty) {
+    store.saveConversation(uid, { id: conv.id, title: text.replace(/\s+/g, ' ').slice(0, 24) });
+  }
+  return { text: result.text, conversationId: conv.id, tools: result.tools || [] };
 });
 
-/* ---------------- 作答 ---------------- */
+/* ---------------- 统一载体 ---------------- */
 
-handle('attempt:open', async ({ paperId }) => {
-  const user = requireUser();
-  const uid = user.id;
-  const settings = settingsOf(uid);
-  const paper = store.getPaper(uid, paperId);
-
-  let attempt = store.activeAttempt(uid, paperId);
-  if (!attempt) attempt = store.newAttempt(uid, paper, settings.defaultModel);
-  if (!cleanModelName(attempt.model)) {
-    attempt.model = '';
-    store.saveAttempt(uid, paperId, attempt);
-  }
-  // 清理旧版遗留的自定义会话 ID
-  let dirty = false;
-  for (const qid of Object.keys(attempt.chatSessions || {})) {
-    const sid = attempt.chatSessions[qid];
-    if (typeof sid !== 'string' || sid.startsWith('ses_wx_')) {
-      delete attempt.chatSessions[qid];
-      dirty = true;
+function findCarrierQuestion(carrier, questionId) {
+  const sections = carrier.sections || [];
+  let index = 0;
+  for (const section of sections) {
+    for (const question of section.questions || []) {
+      if (question.id === String(questionId)) {
+        return { question, section, index, total: sections.reduce((sum, s) => sum + (s.questions || []).length, 0) };
+      }
+      index += 1;
     }
   }
-  if (dirty) store.saveAttempt(uid, paperId, attempt);
-  store.touchPaper(uid, paperId);
+  throw new Error('题目不存在');
+}
 
-  const chats = store.readAllChats(uid, paperId, attempt.id, paper.questions.map((q) => q.id));
-  return { paper, attempt, chats, settings };
+function chatHistoryText(list) {
+  return list
+    .filter((m) => m && String(m.content || m.text || '').trim())
+    .map((m) => `${m.role === 'assistant' ? 'AI' : '用户'}：${String(m.content || m.text).trim()}`)
+    .join('\n');
+}
+
+function carrierFullContext(carrier, attempt) {
+  const lines = [
+    `载体：${carrier.title}（编号 ${carrier.code}，类型 ${carrier.kind}）`,
+    carrier.subject ? `学科：${carrier.subject}` : '',
+    carrier.goal ? `目标：${carrier.goal}` : '',
+    carrier.instructions ? `说明：${carrier.instructions}` : '',
+    `共 ${(carrier.sections || []).reduce((sum, s) => sum + (s.questions || []).length, 0)} 题，满分 ${carrier.totalScore}`
+  ];
+  (carrier.sections || []).forEach((section) => {
+    lines.push(`\n【${section.name}${section.date ? ` · ${section.date}` : ''}】`);
+    (section.questions || []).forEach((q, i) => {
+      const ans = String(((attempt && attempt.answers && attempt.answers[q.id]) || {}).answer || '').trim();
+      const grade = attempt && attempt.grades ? attempt.grades[q.id] : null;
+      lines.push(
+        `${i + 1}. [${q.type}] ${String(q.stem || '').replace(/\s+/g, ' ').slice(0, 160)}\n   作答：${ans ? ans.slice(0, 300) : '（空）'}${grade && grade.score != null ? `　得分：${grade.score}/${q.maxScore}` : ''}`
+      );
+    });
+  });
+  return lines.filter(Boolean).join('\n');
+}
+
+handle('carrier:list', async ({ kind } = {}) => {
+  const uid = requireUser().id;
+  return { carriers: store.listCarrierBriefs(uid, kind || ''), today: store.todayStr() };
 });
 
-handle('attempt:new', async ({ paperId, model }) => {
-  const user = requireUser();
-  const uid = user.id;
-  const paper = store.getPaper(uid, paperId);
-  const attempt = store.newAttempt(uid, paper, cleanModelName(model));
-  store.touchPaper(uid, paperId);
-  return { paper, attempt, chats: {} };
+handle('carrier:get', async ({ code } = {}) => {
+  const uid = requireUser().id;
+  const carrier = store.getCarrier(uid, code);
+  const attempt = store.latestCarrierAttempt(uid, carrier.code) || store.newCarrierAttempt(uid, carrier.code);
+  const chats = {};
+  (carrier.sections || []).forEach((section) => {
+    (section.questions || []).forEach((q) => {
+      chats[q.id] = store.readCarrierChat(uid, carrier.code, attempt.id, q.id);
+    });
+  });
+  return { carrier, attempt, chats, globalChat: store.readCarrierGlobalChat(uid, carrier.code) };
 });
 
-handle('attempt:saveAnswer', async ({ paperId, attemptId, questionId, answer }) => {
-  const user = requireUser();
-  return store.setAnswer(user.id, paperId, attemptId, questionId, answer);
+handle('carrier:save', async (patch) => {
+  const uid = requireUser().id;
+  return { carrier: store.saveCarrier(uid, patch || {}) };
 });
 
-handle('attempt:setModel', async ({ paperId, attemptId, model }) => {
-  const user = requireUser();
-  return store.setModel(user.id, paperId, attemptId, model);
-});
+handle('carrier:delete', async ({ code } = {}) => ({ ok: store.deleteCarrier(requireUser().id, String(code || '')) }));
 
-handle('attempt:finish', async ({ paperId, attemptId }) => {
-  const user = requireUser();
-  return store.finishAttempt(user.id, paperId, attemptId);
-});
-
-handle('attempt:history', async () => {
-  const user = requireUser();
-  return store.listHistory(user.id);
-});
-
-/* ---------------- AI：批改 / 讲解 / 对话 ---------------- */
-
-handle('ai:grade', async ({ paperId, attemptId, questionId, model, runId }) => {
-  const user = requireUser();
-  const uid = user.id;
-  const paper = store.getPaper(uid, paperId);
-  const attempt = store.getAttempt(uid, paperId, attemptId);
-  const { question } = findQuestion(paper, questionId);
-  const answer = (attempt.answers[questionId] || {}).answer || '';
-  const usedModel = modelOf(store.activeProfile(), model || attempt.model);
-
-  if ((question.type === 'choice' || question.type === 'multi_choice') && settingsOf(uid).autoGradeChoice) {
-    const grade = Object.assign(localGrade(question, answer, 'local'), { model: 'local', source: 'local' });
-    store.setGrade(uid, paperId, attemptId, questionId, grade);
-    emit({ runId: runId || 'local', scope: 'grade', questionId, type: 'done', text: grade.comment });
-    return { grade };
+handle('carrier:import', async ({ raw, subject } = {}) => {
+  const uid = requireUser().id;
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('JSON 解析失败，请检查文件格式');
+    }
   }
+  const paper = papersLib.normalizePaper(parsed, { subject });
+  const qById = new Map((paper.questions || []).map((q) => [q.id, q]));
+  const sections = (paper.sections || []).map((section, i) => ({
+    id: `s${i + 1}`,
+    name: section.name,
+    passage: section.passage,
+    date: String((section && section.date) || ''),
+    questions: (section.questionIds || []).map((id) => qById.get(id)).filter(Boolean)
+  }));
+  const carrier = store.saveCarrier(uid, {
+    kind: 'paper',
+    title: paper.title,
+    subject: paper.subject,
+    grade: paper.grade,
+    difficulty: paper.difficulty,
+    instructions: paper.instructions,
+    durationMinutes: paper.durationMinutes,
+    sections
+  });
+  return { carrier };
+});
 
-  const prompt = ai.buildGradePrompt(paper, question, answer);
+handle('carrier:answer', async ({ code, attemptId, questionId, answer, blanks }) => {
+  const uid = requireUser().id;
+  const attempt = store.setCarrierAnswer(uid, String(code), String(attemptId), String(questionId), answer, blanks);
+  return {
+    ok: true,
+    savedAt: (attempt.answers[questionId] || {}).updatedAt || '',
+    answered: String((attempt.answers[questionId] || {}).answer || '').trim().length > 0
+  };
+});
+
+handle('carrier:finish', async ({ code, attemptId } = {}) => {
+  const uid = requireUser().id;
+  return { attempt: store.finishCarrierAttempt(uid, String(code), String(attemptId)) };
+});
+
+handle('carrier:daily', async ({ date } = {}) => {
+  const uid = requireUser().id;
+  return store.carrierDaily(uid, date ? String(date) : undefined);
+});
+
+handle('carrier:history', async () => ({ records: store.listCarrierHistory(requireUser().id) }));
+
+handle('carrier:grade', async ({ code, attemptId, questionId, runId }) => {
+  const uid = requireUser().id;
+  const carrier = store.getCarrier(uid, code);
+  const attempt = store.getCarrierAttempt(uid, code, attemptId);
+  const found = findCarrierQuestion(carrier, questionId);
+  const answer = (attempt.answers[questionId] || {}).answer || '';
+  const usedModel = modelOf(store.activeProfile());
   const result = await runAi({
     runId,
-    model: usedModel,
-    prompt,
-    meta: { scope: 'grade', questionId, paperId, attemptId }
+    prompt: ai.buildGradePrompt(carrier, found.question, answer),
+    meta: { scope: 'carrier', code, questionId }
   });
   if (!result.ok) throw new Error(result.error || '批改失败');
-
-  const grade = ai.parseGrade(result.text, question.maxScore);
+  const grade = ai.parseGrade(result.text, found.question.maxScore);
   grade.model = usedModel;
   grade.source = 'ai';
-  store.setGrade(uid, paperId, attemptId, questionId, grade);
+  store.setCarrierGrade(uid, code, attemptId, questionId, grade);
   return { grade, raw: result.text };
 });
 
-handle('ai:chat', async ({ paperId, attemptId, questionId, model, text, kind, runId }) => {
-  const user = requireUser();
-  const uid = user.id;
-  const paper = store.getPaper(uid, paperId);
-  let attempt = store.getAttempt(uid, paperId, attemptId);
-  const { question, index } = findQuestion(paper, questionId);
-  const usedModel = modelOf(store.activeProfile(), model || attempt.model);
-  const questionText = String(text || '').trim();
-  if (!questionText) throw new Error('请输入要问的内容');
-
-  const history = store.readChat(uid, paperId, attemptId, questionId);
+handle('carrier:qchat', async ({ code, attemptId, questionId, thinking, text, kind, runId, allowFull } = {}) => {
+  const uid = requireUser().id;
+  const carrier = store.getCarrier(uid, code);
+  const attempt = store.getCarrierAttempt(uid, code, attemptId);
+  const found = findCarrierQuestion(carrier, questionId);
+  const content = String(text || '').trim();
+  if (!content) throw new Error('请输入要问的内容');
   const answer = (attempt.answers[questionId] || {}).answer || '';
-  const grade = attempt.grades[questionId] || null;
-  const context = ai.buildQuestionContext(paper, question, index, paper.questions.length, answer, grade);
-  const messages = history
-    .filter((m) => m && String(m.content || '').trim())
-    .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content), timestamp: m.ts || Date.now() }));
-  messages.push({ role: 'user', content: questionText, timestamp: Date.now() });
+  const grade = (attempt.grades || {})[questionId] || null;
+  let systemPrompt = ai.buildQuestionContext(carrier, found.question, found.index, found.total, answer, grade, found.section);
+  if (allowFull) systemPrompt += '\n\n用户已允许读取整套载体：可用 find_carrier / list_carriers 工具查看完整内容。';
+  const history = store.readCarrierChat(uid, code, attemptId, questionId);
+  const historyText = chatHistoryText(history);
+  const hooks = allowFull
+    ? carrierHooks(uid)
+    : { webSearch: (params) => webSearch(uid, params), webFetch: (params) => webFetch(uid, params) };
 
-  store.appendChat(uid, paperId, attemptId, questionId, {
-    role: 'user',
-    kind: kind || 'chat',
-    content: questionText,
-    ts: Date.now()
+  store.appendCarrierChat(uid, code, attemptId, questionId, { role: 'user', kind: kind || 'chat', content, ts: Date.now() });
+  const profile = store.activeProfile();
+  const run = runId || store.rid('run');
+  emit({ runId: run, scope: 'qchat', type: 'start', code, questionId });
+  const result = await pi.runAgent({
+    runId: run,
+    profile,
+    model: modelOf(profile),
+    baseDir: settingsOf(uid).exportDir,
+    systemPrompt,
+    prompt: historyText ? `之前的对话：\n${historyText}\n\n用户现在说：\n${content}` : content,
+    toolHooks: hooks,
+    thinkingLevel: normalizeThinking(thinking || settingsOf(uid).thinkingLevel),
+    timeoutMs: settingsOf(uid).timeoutMs,
+    onEvent: (event) => emit({ runId: run, scope: 'qchat', code, questionId, ...event })
   });
-
-  const result = await runAi({
-    runId,
-    model: usedModel,
-    systemPrompt: context,
-    messages,
-    meta: { scope: 'chat', questionId, paperId, attemptId, kind: kind || 'chat' }
-  });
-
-  const content = result.text || '';
-  if (content.trim()) {
-    store.appendChat(uid, paperId, attemptId, questionId, {
-      role: 'assistant',
-      kind: kind || 'chat',
-      content,
-      ts: Date.now(),
-      model: usedModel,
-      toolCalls: result.tools || [],
-      partial: !result.ok
-    });
+  emit({ runId: run, scope: 'qchat', code, questionId, type: result.error ? 'failed' : 'done', error: result.error || '', text: result.text });
+  if (result.text) {
+    store.appendCarrierChat(uid, code, attemptId, questionId, { role: 'assistant', kind: kind || 'chat', content: result.text, ts: Date.now() });
   }
-  if (!result.ok && !content.trim()) throw new Error(result.error || 'AI 没有返回内容');
-  return { text: content, sessionId: '', runId: result.runId, error: result.ok ? '' : result.error || '' };
+  return { text: result.text, tools: result.tools || [], error: result.error || '' };
 });
 
-handle('ai:explain', async ({ paperId, attemptId, questionId, model, runId }) => {
-  const user = requireUser();
-  const uid = user.id;
-  const paper = store.getPaper(uid, paperId);
-  let attempt = store.getAttempt(uid, paperId, attemptId);
-  const { question, index } = findQuestion(paper, questionId);
-  const usedModel = modelOf(store.activeProfile(), model || attempt.model);
-  const answer = (attempt.answers[questionId] || {}).answer || '';
-  const grade = attempt.grades[questionId] || null;
-
-  const prompt = ai.buildExplainPrompt(paper, question, answer, grade);
-  store.appendChat(uid, paperId, attemptId, questionId, {
-    role: 'user',
-    kind: 'explain',
-    content: '一键讲解这道题',
-    ts: Date.now()
+handle('carrier:gchat', async ({ code, thinking, text, runId } = {}) => {
+  const uid = requireUser().id;
+  const carrier = store.getCarrier(uid, code);
+  const attempt = store.latestCarrierAttempt(uid, code);
+  const content = String(text || '').trim();
+  if (!content) throw new Error('请输入要问的内容');
+  const history = store.readCarrierGlobalChat(uid, code);
+  const historyText = chatHistoryText(history);
+  const systemPrompt = [
+    '你是「问学」里的整套学习教练，掌握下面这个载体的全部题目、作答与得分。',
+    `今天是 ${store.todayStr()}。`,
+    carrierFullContext(carrier, attempt),
+    '回答用中文：先给结论，再给依据；可以做整体错题分析、提分建议和下一步安排。'
+  ].join('\n');
+  store.appendCarrierGlobalChat(uid, code, { role: 'user', content, ts: Date.now() });
+  const profile = store.activeProfile();
+  const run = runId || store.rid('run');
+  emit({ runId: run, scope: 'gchat', type: 'start', code });
+  const result = await pi.runAgent({
+    runId: run,
+    profile,
+    model: modelOf(profile),
+    baseDir: settingsOf(uid).exportDir,
+    systemPrompt,
+    prompt: historyText ? `之前的对话：\n${historyText}\n\n用户现在说：\n${content}` : content,
+    toolHooks: carrierHooks(uid),
+    thinkingLevel: normalizeThinking(thinking || settingsOf(uid).thinkingLevel),
+    timeoutMs: settingsOf(uid).timeoutMs,
+    onEvent: (event) => emit({ runId: run, scope: 'gchat', code, ...event })
   });
-
-  const result = await runAi({
-    runId,
-    model: usedModel,
-    prompt,
-    meta: { scope: 'chat', questionId, paperId, attemptId, kind: 'explain' }
-  });
-  const content = result.text || '';
-  if (content.trim()) {
-    store.appendChat(uid, paperId, attemptId, questionId, {
-      role: 'assistant',
-      kind: 'explain',
-      content,
-      ts: Date.now(),
-      model: usedModel,
-      toolCalls: result.tools || [],
-      partial: !result.ok
-    });
+  emit({ runId: run, scope: 'gchat', code, type: result.error ? 'failed' : 'done', error: result.error || '', text: result.text });
+  if (result.text) {
+    store.appendCarrierGlobalChat(uid, code, { role: 'assistant', content: result.text, ts: Date.now() });
   }
-  if (!result.ok && !content.trim()) throw new Error(result.error || '讲解失败');
-  return { text: content, sessionId: '', runId: result.runId, error: result.ok ? '' : result.error || '' };
+  return { text: result.text, tools: result.tools || [], error: result.error || '' };
 });
 
-handle('ai:cancel', async ({ runId }) => ({ cancelled: pi.cancel(runId) }));
+/* ---------------- 取消 ---------------- */
+
+handle('ai:cancel', async ({ runId }) => {
+  const hit = textRuns.get(runId);
+  if (hit) {
+    hit.abort();
+    return { cancelled: true };
+  }
+  return { cancelled: pi.cancel(runId) };
+});
 
 /* ---------------- 窗口 ---------------- */
 
 function createWindow() {
+  const isMac = process.platform === 'darwin';
   mainWindow = new BrowserWindow({
     width: 1380,
     height: 920,
@@ -469,6 +708,12 @@ function createWindow() {
     backgroundColor: '#F6F3ED',
     title: '问学 · AI 试卷练习',
     show: false,
+    ...(isMac
+      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 18, y: 24 } }
+      : {
+          titleBarStyle: 'hidden',
+          titleBarOverlay: { color: '#F8F5EF', symbolColor: '#3E4A3F', height: 40 }
+        }),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -502,6 +747,11 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     store.init();
+    try {
+      store.migrateToCarriers(store.localUser().id);
+    } catch {
+      /* 迁移失败不阻塞启动 */
+    }
     createWindow();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

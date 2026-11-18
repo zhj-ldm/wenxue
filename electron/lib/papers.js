@@ -122,6 +122,7 @@ function inferType(raw, options) {
     other: 'other'
   };
   if (map[declared]) return map[declared];
+  if (Array.isArray(raw.blanks) && raw.blanks.length) return 'fill_blank';
   if (options.length >= 2) return 'choice';
   return 'short_answer';
 }
@@ -146,19 +147,40 @@ function normalizeQuestion(raw, index, sectionName) {
 
   const type = inferType(raw, options);
   const scoreForRubric = maxScore;
+  const blanksRaw = raw.blanks || raw.空格 || raw.每空;
+  const blanks = Array.isArray(blanksRaw)
+    ? blanksRaw
+        .map((b, i) => {
+          if (b == null) return null;
+          if (typeof b === 'string') return { key: String(i + 1), answer: b, maxScore: 0, width: 0 };
+          return {
+            key: String(b.key || b.id || i + 1),
+            answer: String(b.answer || b.referenceAnswer || b.参考答案 || ''),
+            maxScore: Number(b.maxScore || b.score) || 0,
+            width: Number(b.width) || 0
+          };
+        })
+        .filter(Boolean)
+    : [];
+  const layout = String(raw.layout || raw.版式 || (blanks.length ? 'inline' : 'block')).toLowerCase() === 'inline' ? 'inline' : 'block';
 
   return {
     id: String(raw.id || `q${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '') || `q${index + 1}`,
     section: String(pick(raw, ['section', 'part', 'group', '部分', '分区']) || sectionName || '').trim(),
     type,
+    layout,
     stem,
     passage,
+    blanks,
     options: type === 'choice' || type === 'multi_choice' ? options : options.length ? options : [],
     maxScore,
     referenceAnswer: referenceAnswer || (type === 'choice' ? 'A' : ''),
     rubric: normalizeRubric(raw.rubric || raw.评分细则 || raw.scoring || raw.criteria, scoreForRubric),
     knowledgePoints,
     difficulty: Math.min(5, Math.max(1, Math.round(toNumber(raw.difficulty, 3)))),
+    date: String(raw.date || raw.日期 || '').trim(),
+    actions: normalizeActions(raw.actions),
+    answerMode: (raw.answerMode || raw.answerType) === 'open' ? 'open' : 'fixed',
     explanation: String(pick(raw, ['explanation', 'analysis', '解析', '命题解析']) || '').trim(),
     sourceNote: String(pick(raw, ['sourceNote', 'source', '来源']) || '').trim()
   };
@@ -240,6 +262,103 @@ function normalizePaper(raw, opts = {}) {
   };
 }
 
+/* ---------------- 统一载体（试卷 / 练习 / 提升计划） ---------------- */
+
+function normalizeActions(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  return {
+    grade: src.grade !== false,
+    explain: src.explain !== false,
+    chat: src.chat !== false
+  };
+}
+
+function normalizeCarrier(raw, opts = {}) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const kind = ['paper', 'practice', 'plan'].includes(opts.kind || src.kind) ? opts.kind || src.kind : 'paper';
+  const rawSections = Array.isArray(src.sections) ? src.sections : [];
+  const sections = rawSections
+    .map((section, si) => {
+      const sec = section && typeof section === 'object' ? section : {};
+      const rawQuestions = Array.isArray(sec.questions) ? sec.questions : [];
+      const questions = rawQuestions
+        .map((q, qi) =>
+          normalizeQuestion(
+            Object.assign({}, q, {
+              id: q && q.id ? q.id : `q${si + 1}_${qi + 1}`,
+              date: String((q && q.date) || ''),
+              actions: normalizeActions(q && q.actions),
+              answerMode: (q && q.answerMode) === 'open' ? 'open' : 'fixed'
+            }),
+            qi,
+            sec.name || ''
+          )
+        )
+        .filter(Boolean);
+      return {
+        id: String(sec.id || `s${si + 1}`),
+        name: String(sec.name || `第 ${si + 1} 部分`).trim(),
+        passage: String(sec.passage || '').trim(),
+        date: String(sec.date || '').trim(),
+        questions
+      };
+    })
+    .filter((s) => s.questions.length);
+
+  if (!sections.length) throw new Error('载体里没有题目，无法保存');
+
+  const questions = sections.flatMap((s) => s.questions);
+  const sum = questions.reduce((acc, q) => acc + q.maxScore, 0);
+  const declared = toNumber(src.totalScore, 0);
+  const totalScore = declared > 0 && Math.abs(declared - sum) < 0.5 ? declared : Math.round(sum * 10) / 10;
+
+  return {
+    schemaVersion: 2,
+    code: String(src.code || '').toUpperCase(),
+    kind,
+    title: String(src.title || '未命名').trim(),
+    subject: String(src.subject || '综合').trim(),
+    grade: String(src.grade || '').trim(),
+    goal: String(src.goal || '').trim(),
+    difficulty: Math.min(5, Math.max(1, Math.round(toNumber(src.difficulty, 3)))),
+    totalScore,
+    durationMinutes: Math.max(0, Math.round(toNumber(src.durationMinutes, 0))),
+    instructions: String(src.instructions || '').trim(),
+    sourceFile: String(src.sourceFile || '').trim(),
+    createdAt: src.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    sections
+  };
+}
+
+function carrierQuestions(carrier) {
+  const sections = Array.isArray(carrier.sections) ? carrier.sections : [];
+  return sections.flatMap((section) =>
+    (section.questions || []).map((q) => ({ question: q, section }))
+  );
+}
+
+function carrierSummary(carrier, extra = {}) {
+  const questions = carrierQuestions(carrier);
+  return Object.assign(
+    {
+      code: carrier.code,
+      kind: carrier.kind,
+      title: carrier.title,
+      subject: carrier.subject,
+      grade: carrier.grade,
+      goal: carrier.goal,
+      totalScore: carrier.totalScore,
+      durationMinutes: carrier.durationMinutes,
+      questionCount: questions.length,
+      sectionCount: (carrier.sections || []).length,
+      createdAt: carrier.createdAt,
+      updatedAt: carrier.updatedAt
+    },
+    extra
+  );
+}
+
 function summary(paper, extra = {}) {
   return Object.assign(
     {
@@ -270,6 +389,9 @@ module.exports = {
   TYPE_LABEL,
   normalizePaper,
   normalizeQuestion,
+  normalizeCarrier,
+  carrierQuestions,
+  carrierSummary,
   summary,
   exportFilename
 };

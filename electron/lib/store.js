@@ -22,7 +22,12 @@ function readJson(file, fallback) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
-    return fallback;
+    // 文件损坏时尝试从上次的备份恢复，避免整份会话/作答直接丢失
+    try {
+      return JSON.parse(fs.readFileSync(`${file}.bak`, 'utf8'));
+    } catch {
+      return fallback;
+    }
   }
 }
 
@@ -30,6 +35,11 @@ function writeJson(file, value) {
   ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
+  try {
+    if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak`);
+  } catch {
+    /* 备份失败不影响正常写入 */
+  }
   fs.renameSync(tmp, file);
   return value;
 }
@@ -294,20 +304,20 @@ function userSettingsFile(uid) {
 
 function defaultUserSettings() {
   return {
-    defaultModel: '',
     exportDir: path.join(app.getPath('documents'), '问学试卷'),
     timeoutMs: 180000,
-    autoGradeChoice: true
+    autoGradeChoice: true,
+    searchCmd: '',
+    thinkingLevel: 'medium'
   };
 }
 
 function readUserSettings(uid) {
   const saved = readJson(userSettingsFile(uid), {});
   const merged = Object.assign(defaultUserSettings(), saved);
-  // 旧版遗留的默认模型统一清空，改为跟随接口配置
-  if (/opencode|big-pickle/i.test(String(merged.defaultModel || ''))) {
-    merged.defaultModel = '';
-  }
+  // 清理旧版本残留字段
+  delete merged.defaultModel;
+  delete merged.cliPath;
   return merged;
 }
 
@@ -399,17 +409,41 @@ function walkJsonFiles(dir, out = [], depth = 0) {
 
 let scanCache = { at: 0, dir: '', result: null };
 
-// 扫描「放题文件夹」，把其中尚未入库的试卷 JSON 自动收录进试卷库
-function syncPaperFolder(uid, { force = false } = {}) {
+// 把放题目录里的一份 JSON 转成载体：带 kind/sections 的按载体解析，其余按旧试卷格式解析
+function carrierFromFile(raw) {
+  if (raw && (['paper', 'practice', 'plan'].includes(raw.kind) || raw.carrier)) {
+    return papersLib.normalizeCarrier(raw.carrier || raw);
+  }
+  const paper = papersLib.normalizePaper(raw);
+  const sections = (paper.sections || []).map((sec, i) => ({
+    id: sec.id || `s${i + 1}`,
+    name: sec.name || `第 ${i + 1} 部分`,
+    passage: sec.passage || '',
+    questions: sec.questionIds.map((qid) => paper.questions.find((q) => q.id === qid)).filter(Boolean)
+  }));
+  return papersLib.normalizeCarrier({
+    kind: 'paper',
+    title: paper.title,
+    subject: paper.subject,
+    grade: paper.grade,
+    difficulty: paper.difficulty,
+    totalScore: paper.totalScore,
+    durationMinutes: paper.durationMinutes,
+    instructions: paper.instructions,
+    sections
+  });
+}
+
+// 扫描「放题目录」，把尚未收录的 JSON 自动导入为载体（试卷/练习/提升计划）
+function syncCarrierFolder(uid, { force = false } = {}) {
   const dir = path.resolve(readUserSettings(uid).exportDir);
   if (!force && scanCache.result && scanCache.dir === dir && Date.now() - scanCache.at < 8000) {
     return scanCache.result;
   }
 
   const files = walkJsonFiles(dir);
-  const index = listPaperIndex(uid);
-  const seenIds = new Set(index.map((p) => p.id));
-  const seenKeys = new Set(index.map((p) => `${p.title}::${p.totalScore}::${p.questionCount}`));
+  const existing = listCarriers(uid);
+  const byKey = new Map(existing.map((c) => [`${c.title}::${c.totalScore}::${papersLib.carrierQuestions(c).length}`, c]));
   const added = [];
   let skipped = 0;
 
@@ -421,28 +455,37 @@ function syncPaperFolder(uid, { force = false } = {}) {
       skipped += 1;
       continue;
     }
-    let paper = null;
+    let carrier = null;
     try {
-      paper = papersLib.normalizePaper(raw);
+      carrier = carrierFromFile(raw);
     } catch {
       skipped += 1;
       continue;
     }
-    if (!paper || !paper.questions.length) {
+    const key = `${carrier.title}::${carrier.totalScore}::${papersLib.carrierQuestions(carrier).length}`;
+    const hit = byKey.get(key);
+    if (hit) {
+      // 补记来源文件，这样在应用里删除时能同时删掉源 JSON，避免重启后又被导入
+      if (!hit.sourceFile) {
+        try {
+          saveCarrier(uid, Object.assign({}, hit, { sourceFile: file }));
+        } catch {
+          /* ignore */
+        }
+      }
+      continue;
+    }
+    try {
+      carrier = saveCarrier(uid, Object.assign({}, carrier, { sourceFile: file }));
+    } catch {
       skipped += 1;
       continue;
     }
-    const key = `${paper.title}::${paper.totalScore}::${paper.questions.length}`;
-    if (seenIds.has(paper.id) || seenKeys.has(key)) continue;
-
-    paper.importedFrom = file;
-    savePaper(uid, paper, papersLib.summary(paper, { importedFrom: file, lastOpenedAt: nowIso() }));
-    seenIds.add(paper.id);
-    seenKeys.add(key);
-    added.push({ id: paper.id, title: paper.title, file });
+    byKey.set(key, carrier);
+    added.push({ code: carrier.code, title: carrier.title, kind: carrier.kind, file });
   }
 
-  const result = { dir, scanned: files.length, added: added.length, papers: added, skipped };
+  const result = { dir, scanned: files.length, added: added.length, carriers: added, skipped };
   scanCache = { at: Date.now(), dir, result };
   return result;
 }
@@ -518,10 +561,14 @@ function saveAttempt(uid, paperId, attempt) {
   return attempt;
 }
 
-function setAnswer(uid, paperId, attemptId, questionId, answer) {
+function setAnswer(uid, paperId, attemptId, questionId, answer, blanks) {
   const attempt = readJson(attemptFile(uid, paperId, attemptId), null);
   if (!attempt) throw new Error('作答记录不存在');
-  attempt.answers[questionId] = { answer: answer == null ? '' : String(answer), updatedAt: nowIso() };
+  const record = { answer: answer == null ? '' : String(answer), updatedAt: nowIso() };
+  if (blanks && typeof blanks === 'object') {
+    record.blanks = Object.fromEntries(Object.entries(blanks).map(([k, v]) => [String(k), v == null ? '' : String(v)]));
+  }
+  attempt.answers[questionId] = record;
   return saveAttempt(uid, paperId, attempt);
 }
 
@@ -652,6 +699,783 @@ function listHistory(uid) {
   return out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 
+/* ---------------- 提升计划 / 每日任务 ---------------- */
+
+function plansFile(uid) {
+  return path.join(userDir(uid), 'plans.json');
+}
+
+function tasksDir(uid) {
+  return ensureDir(path.join(userDir(uid), 'tasks'));
+}
+
+function taskFile(uid, taskId) {
+  return path.join(tasksDir(uid), `${String(taskId).replace(/[^a-zA-Z0-9_-]/g, '')}.json`);
+}
+
+function todayStr(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function listPlans(uid) {
+  const list = readJson(plansFile(uid), []);
+  return Array.isArray(list) ? list : [];
+}
+
+function getPlan(uid, planId) {
+  const plan = listPlans(uid).find((p) => p.id === planId);
+  if (!plan) throw new Error('提升计划不存在');
+  return plan;
+}
+
+function savePlan(uid, patch = {}) {
+  const list = listPlans(uid);
+  const now = nowIso();
+  const id = String(patch.id || rid('plan'));
+  const exist = list.find((p) => p.id === id);
+  const plan = Object.assign(
+    { id, title: '未命名计划', subject: '', goal: '', days: 0, createdAt: now },
+    exist || {},
+    patch,
+    { id, updatedAt: now }
+  );
+  if (exist) list[list.indexOf(exist)] = plan;
+  else list.unshift(plan);
+  writeJson(plansFile(uid), list);
+  return plan;
+}
+
+function deletePlan(uid, planId) {
+  const list = listPlans(uid).filter((p) => p.id !== planId);
+  writeJson(plansFile(uid), list);
+  listTasks(uid)
+    .filter((t) => t.planId === planId)
+    .forEach((t) => deleteTask(uid, t.id));
+  return true;
+}
+
+function normalizeTaskQuestions(rawQuestions) {
+  const list = Array.isArray(rawQuestions) ? rawQuestions : [];
+  return list
+    .map((q, i) => {
+      if (!q || typeof q !== 'object') return null;
+      const stem = String(q.stem || '').trim();
+      const passage = String(q.passage || '').trim();
+      const blanks = Array.isArray(q.blanks)
+        ? q.blanks
+            .map((b, bi) => {
+              if (b == null) return null;
+              if (typeof b === 'string') return { key: String(bi + 1), answer: b, maxScore: 0, width: 0 };
+              return {
+                key: String(b.key || b.id || bi + 1),
+                answer: String(b.answer || b.referenceAnswer || ''),
+                maxScore: Number(b.maxScore || b.score) || 0,
+                width: Number(b.width) || 0
+              };
+            })
+            .filter(Boolean)
+        : [];
+      if (!stem && !passage) return null;
+      const options = Array.isArray(q.options)
+        ? q.options
+            .map((o) => (typeof o === 'string' ? { key: '', text: o } : { key: String(o.key || ''), text: String(o.text || '') }))
+            .filter((o) => o.text)
+        : [];
+      return {
+        id: String(q.id || `tq${i + 1}`),
+        type: String(q.type || (blanks.length ? 'fill_blank' : options.length ? 'choice' : 'short_answer')),
+        layout: String(q.layout || (blanks.length ? 'inline' : 'block')) === 'inline' ? 'inline' : 'block',
+        stem,
+        passage,
+        blanks,
+        options,
+        maxScore: Number(q.maxScore) || 0,
+        referenceAnswer: String(q.referenceAnswer || ''),
+        rubric: Array.isArray(q.rubric) ? q.rubric : [],
+        knowledgePoints: Array.isArray(q.knowledgePoints) ? q.knowledgePoints : [],
+        difficulty: String(q.difficulty || '')
+      };
+    })
+    .filter(Boolean);
+}
+
+function saveTask(uid, patch = {}) {
+  const now = nowIso();
+  const id = String(patch.id || rid('task'));
+  const file = taskFile(uid, id);
+  const exist = readJson(file, null);
+  const questions = normalizeTaskQuestions(patch.questions || (exist && exist.questions));
+  const task = Object.assign(
+    {
+      id,
+      planId: '',
+      title: '每日一练',
+      date: todayStr(),
+      subject: '',
+      note: '',
+      questions,
+      answers: {},
+      grades: {},
+      createdAt: now
+    },
+    exist || {},
+    patch,
+    { id, questions, updatedAt: now }
+  );
+  if (!task.answers) task.answers = {};
+  if (!task.grades) task.grades = {};
+  writeJson(file, task);
+  return task;
+}
+
+function listTasks(uid) {
+  let names = [];
+  try {
+    names = fs.readdirSync(tasksDir(uid)).filter((n) => /\.json$/i.test(n));
+  } catch {
+    return [];
+  }
+  return names
+    .map((n) => readJson(path.join(tasksDir(uid), n), null))
+    .filter(Boolean)
+    .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+function getTask(uid, taskId) {
+  const task = readJson(taskFile(uid, taskId), null);
+  if (!task) throw new Error('任务不存在或已删除');
+  return task;
+}
+
+function deleteTask(uid, taskId) {
+  fs.rmSync(taskFile(uid, taskId), { force: true });
+  fs.rmSync(path.join(tasksDir(uid), 'chats', String(taskId).replace(/[^a-zA-Z0-9_-]/g, '')), { recursive: true, force: true });
+  return true;
+}
+
+function setTaskAnswer(uid, taskId, questionId, answer, blanks) {
+  const task = getTask(uid, taskId);
+  const record = { answer: answer == null ? '' : String(answer), updatedAt: nowIso() };
+  if (blanks && typeof blanks === 'object') {
+    record.blanks = Object.fromEntries(Object.entries(blanks).map(([k, v]) => [String(k), v == null ? '' : String(v)]));
+  }
+  task.answers[questionId] = record;
+  return saveTask(uid, task);
+}
+
+function setTaskGrade(uid, taskId, questionId, grade) {
+  const task = getTask(uid, taskId);
+  task.grades[questionId] = grade;
+  return saveTask(uid, task);
+}
+
+function finishTask(uid, taskId) {
+  const task = getTask(uid, taskId);
+  const ids = task.questions.map((q) => q.id);
+  let score = 0;
+  let max = 0;
+  ids.forEach((qid) => {
+    const q = task.questions.find((x) => x.id === qid);
+    max += Number(q.maxScore) || 0;
+    const g = task.grades[qid];
+    if (g && typeof g.score === 'number') score += g.score;
+  });
+  task.completedAt = nowIso();
+  task.summary = { score: Math.round(score * 10) / 10, max, graded: Object.keys(task.grades || {}).length, total: ids.length };
+  return saveTask(uid, task);
+}
+
+function taskChatFile(uid, taskId, questionId) {
+  const dir = ensureDir(path.join(tasksDir(uid), 'chats', String(taskId).replace(/[^a-zA-Z0-9_-]/g, '')));
+  return path.join(dir, `${String(questionId).replace(/[^a-zA-Z0-9_-]/g, '')}.jsonl`);
+}
+
+function readTaskChat(uid, taskId, questionId) {
+  try {
+    return fs
+      .readFileSync(taskChatFile(uid, taskId, questionId), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function appendTaskChat(uid, taskId, questionId, message) {
+  fs.appendFileSync(taskChatFile(uid, taskId, questionId), `${JSON.stringify(message)}\n`, 'utf8');
+  return message;
+}
+
+/* ---------------- AI 对话会话 ---------------- */
+
+function conversationsFile(uid) {
+  return path.join(userDir(uid), 'conversations.json');
+}
+
+function listConversations(uid) {
+  const list = readJson(conversationsFile(uid), []);
+  return Array.isArray(list) ? list : [];
+}
+
+function getConversation(uid, id) {
+  const conv = listConversations(uid).find((c) => c.id === id);
+  if (!conv) throw new Error('对话不存在或已删除');
+  return conv;
+}
+
+function saveConversation(uid, patch = {}) {
+  const list = listConversations(uid);
+  const now = nowIso();
+  const id = String(patch.id || rid('conv'));
+  const exist = list.find((c) => c.id === id);
+  const conv = Object.assign(
+    { id, title: '新对话', messages: [], createdAt: now },
+    exist || {},
+    patch,
+    { id, updatedAt: now }
+  );
+  if (!Array.isArray(conv.messages)) conv.messages = [];
+  if (conv.messages.length > 400) conv.messages = conv.messages.slice(-400);
+  if (exist) list[list.indexOf(exist)] = conv;
+  else list.unshift(conv);
+  writeJson(conversationsFile(uid), list);
+  return conv;
+}
+
+function appendConversationMessage(uid, id, message) {
+  const conv = getConversation(uid, id);
+  conv.messages.push(message);
+  return saveConversation(uid, conv);
+}
+
+function deleteConversation(uid, id) {
+  const list = listConversations(uid).filter((c) => c.id !== id);
+  writeJson(conversationsFile(uid), list);
+  return true;
+}
+
+function listConversationBriefs(uid) {
+  return listConversations(uid)
+    .map((c) => {
+      const messages = Array.isArray(c.messages) ? c.messages : [];
+      const last = [...messages].reverse().find((m) => String(m.text || '').trim());
+      return {
+        id: c.id,
+        title: c.title || '新对话',
+        updatedAt: c.updatedAt || c.createdAt,
+        messageCount: messages.length,
+        preview: last ? String(last.text).replace(/\s+/g, ' ').slice(0, 60) : ''
+      };
+    })
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+/* ---------------- 统一载体（试卷 / 练习 / 提升计划） ---------------- */
+
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+function carriersRoot(uid) {
+  return ensureDir(path.join(userDir(uid), 'carriers'));
+}
+
+function carrierDir(uid, code) {
+  return path.join(carriersRoot(uid), String(code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase());
+}
+
+function carrierFile(uid, code) {
+  return path.join(carrierDir(uid, code), 'carrier.json');
+}
+
+function newCarrierCode(uid) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    let code = '';
+    for (let i = 0; i < 8; i += 1) code += CODE_ALPHABET[crypto.randomInt(0, CODE_ALPHABET.length)];
+    if (!fs.existsSync(carrierDir(uid, code))) return code;
+  }
+  throw new Error('生成载体编号失败，请重试');
+}
+
+function listCarriers(uid) {
+  let names = [];
+  try {
+    names = fs.readdirSync(carriersRoot(uid)).filter((n) => fs.existsSync(path.join(carriersRoot(uid), n, 'carrier.json')));
+  } catch {
+    return [];
+  }
+  return names
+    .map((n) => readJson(path.join(carriersRoot(uid), n, 'carrier.json'), null))
+    .filter(Boolean)
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+}
+
+function getCarrier(uid, code) {
+  const carrier = readJson(carrierFile(uid, code), null);
+  if (!carrier) throw new Error('载体不存在或已删除');
+  return carrier;
+}
+
+function saveCarrier(uid, patch = {}) {
+  const exist = patch.code ? readJson(carrierFile(uid, patch.code), null) : null;
+  const code = String(patch.code || (exist && exist.code) || newCarrierCode(uid)).toUpperCase();
+  const carrier = papersLib.normalizeCarrier(
+    Object.assign({}, exist || {}, patch, { code, createdAt: (exist && exist.createdAt) || patch.createdAt || nowIso() })
+  );
+  writeJson(carrierFile(uid, code), carrier);
+  return carrier;
+}
+
+function deleteCarrier(uid, code) {
+  const carrier = readJson(carrierFile(uid, code), null);
+  // 从放题目录同步进来的载体：同时删掉源文件，否则下次启动又会被扫回来
+  if (carrier && carrier.sourceFile) {
+    try {
+      const root = path.resolve(readUserSettings(uid).exportDir);
+      const abs = path.resolve(carrier.sourceFile);
+      if (abs.startsWith(`${root}${path.sep}`) && /\.json$/i.test(abs)) fs.rmSync(abs, { force: true });
+    } catch {
+      /* 源文件删除失败不影响载体删除 */
+    }
+  }
+  fs.rmSync(carrierDir(uid, code), { recursive: true, force: true });
+  return true;
+}
+
+/* ---------------- 载体作答 ---------------- */
+
+function carrierAttemptsDir(uid, code) {
+  return ensureDir(path.join(carrierDir(uid, code), 'attempts'));
+}
+
+function listCarrierAttemptIds(uid, code) {
+  try {
+    return fs
+      .readdirSync(carrierAttemptsDir(uid, code))
+      .filter((n) => fs.existsSync(path.join(carrierAttemptsDir(uid, code), n, 'attempt.json')));
+  } catch {
+    return [];
+  }
+}
+
+function newCarrierAttempt(uid, code) {
+  const carrier = getCarrier(uid, code);
+  const attempt = {
+    id: rid('att'),
+    carrierCode: carrier.code,
+    kind: carrier.kind,
+    startedAt: nowIso(),
+    updatedAt: nowIso(),
+    finishedAt: null,
+    answers: {},
+    grades: {},
+    chatSessions: {},
+    summary: null
+  };
+  writeJson(path.join(carrierAttemptsDir(uid, code), attempt.id, 'attempt.json'), attempt);
+  return attempt;
+}
+
+function latestCarrierAttempt(uid, code) {
+  const ids = listCarrierAttemptIds(uid, code);
+  if (!ids.length) return null;
+  return (
+    ids
+      .map((id) => readJson(path.join(carrierAttemptsDir(uid, code), id, 'attempt.json'), null))
+      .filter(Boolean)
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))[0] || null
+  );
+}
+
+function activeCarrierAttempt(uid, code) {
+  const latest = latestCarrierAttempt(uid, code);
+  if (latest && !latest.finishedAt) return latest;
+  return newCarrierAttempt(uid, code);
+}
+
+function getCarrierAttempt(uid, code, attemptId) {
+  const attempt = readJson(path.join(carrierAttemptsDir(uid, code), String(attemptId), 'attempt.json'), null);
+  if (!attempt) throw new Error('作答记录不存在');
+  return attempt;
+}
+
+function saveCarrierAttempt(uid, code, attempt) {
+  attempt.updatedAt = nowIso();
+  writeJson(path.join(carrierAttemptsDir(uid, code), attempt.id, 'attempt.json'), attempt);
+  return attempt;
+}
+
+function setCarrierAnswer(uid, code, attemptId, questionId, answer, blanks) {
+  const attempt = getCarrierAttempt(uid, code, attemptId);
+  const record = { answer: answer == null ? '' : String(answer), updatedAt: nowIso() };
+  if (blanks && typeof blanks === 'object') {
+    record.blanks = Object.fromEntries(Object.entries(blanks).map(([k, v]) => [String(k), v == null ? '' : String(v)]));
+  }
+  attempt.answers[questionId] = record;
+  return saveCarrierAttempt(uid, code, attempt);
+}
+
+function setCarrierGrade(uid, code, attemptId, questionId, grade) {
+  const attempt = getCarrierAttempt(uid, code, attemptId);
+  attempt.grades[questionId] = grade;
+  return saveCarrierAttempt(uid, code, attempt);
+}
+
+function finishCarrierAttempt(uid, code, attemptId) {
+  const attempt = getCarrierAttempt(uid, code, attemptId);
+  const carrier = getCarrier(uid, code);
+  const questions = papersLib.carrierQuestions(carrier).map((x) => x.question);
+  let total = 0;
+  let graded = 0;
+  questions.forEach((q) => {
+    const g = attempt.grades[q.id];
+    if (g && typeof g.score === 'number') {
+      total += g.score;
+      graded += 1;
+    }
+  });
+  attempt.finishedAt = nowIso();
+  attempt.summary = {
+    total: Math.round(total * 10) / 10,
+    max: carrier.totalScore,
+    graded,
+    totalQuestions: questions.length
+  };
+  return saveCarrierAttempt(uid, code, attempt);
+}
+
+/* ---------------- 载体对话 ---------------- */
+
+function carrierChatFile(uid, code, attemptId, questionId) {
+  return path.join(
+    carrierAttemptsDir(uid, code),
+    String(attemptId),
+    'chats',
+    `${String(questionId).replace(/[^a-zA-Z0-9_-]/g, '')}.jsonl`
+  );
+}
+
+function readCarrierChat(uid, code, attemptId, questionId) {
+  try {
+    return fs
+      .readFileSync(carrierChatFile(uid, code, attemptId, questionId), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function appendCarrierChat(uid, code, attemptId, questionId, message) {
+  const file = carrierChatFile(uid, code, attemptId, questionId);
+  ensureDir(path.dirname(file));
+  fs.appendFileSync(file, `${JSON.stringify(message)}\n`, 'utf8');
+  return message;
+}
+
+function carrierGlobalChatFile(uid, code) {
+  return path.join(carrierDir(uid, code), 'global-chat.jsonl');
+}
+
+function readCarrierGlobalChat(uid, code) {
+  try {
+    return fs
+      .readFileSync(carrierGlobalChatFile(uid, code), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function appendCarrierGlobalChat(uid, code, message) {
+  const file = carrierGlobalChatFile(uid, code);
+  ensureDir(path.dirname(file));
+  fs.appendFileSync(file, `${JSON.stringify(message)}\n`, 'utf8');
+  return message;
+}
+
+/* ---------------- 每日任务聚合 ---------------- */
+
+function carrierQuestionDate(section, question) {
+  return String((question && question.date) || (section && section.date) || '').trim();
+}
+
+function carrierProgress(uid, carrier) {
+  const attempt = latestCarrierAttempt(uid, carrier.code);
+  const questions = papersLib.carrierQuestions(carrier);
+  let answered = 0;
+  questions.forEach(({ question }) => {
+    if (String(((attempt && attempt.answers && attempt.answers[question.id]) || {}).answer || '').trim()) answered += 1;
+  });
+  return {
+    questionCount: questions.length,
+    answered,
+    totalScore: carrier.totalScore,
+    finishedAt: attempt ? attempt.finishedAt : null,
+    summary: attempt ? attempt.summary : null
+  };
+}
+
+function listCarrierBriefs(uid, kind = '') {
+  return listCarriers(uid)
+    .filter((c) => !kind || c.kind === kind)
+    .map((c) => papersLib.carrierSummary(c, carrierProgress(uid, c)));
+}
+
+function listCarrierHistory(uid) {
+  const out = [];
+  listCarriers(uid).forEach((carrier) => {
+    listCarrierAttemptIds(uid, carrier.code).forEach((attemptId) => {
+      const attempt = readJson(path.join(carrierAttemptsDir(uid, carrier.code), attemptId, 'attempt.json'), null);
+      if (!attempt) return;
+      const answers = attempt.answers || {};
+      const grades = attempt.grades || {};
+      let total = 0;
+      Object.values(grades).forEach((g) => {
+        if (g && typeof g.score === 'number') total += g.score;
+      });
+      out.push({
+        code: carrier.code,
+        kind: carrier.kind,
+        title: carrier.title,
+        subject: carrier.subject,
+        attemptId,
+        startedAt: attempt.startedAt,
+        updatedAt: attempt.updatedAt,
+        finishedAt: attempt.finishedAt,
+        answered: Object.values(answers).filter((a) => String((a || {}).answer || '').trim()).length,
+        graded: Object.keys(grades).length,
+        total: Math.round(total * 10) / 10,
+        max: carrier.totalScore
+      });
+    });
+  });
+  return out.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+}
+
+function carrierDaily(uid, date) {
+  const today = date || todayStr();
+  const items = [];
+  listCarriers(uid).forEach((carrier) => {
+    const attempt = latestCarrierAttempt(uid, carrier.code);
+    const due = [];
+    papersLib.carrierQuestions(carrier).forEach(({ question, section }) => {
+      const day = carrierQuestionDate(section, question);
+      if (!day || day > today) return;
+      const answered = String(((attempt && attempt.answers && attempt.answers[question.id]) || {}).answer || '').trim().length > 0;
+      due.push({ question, section, day, answered });
+    });
+    if (!due.length) return;
+    const pending = due.filter((x) => !x.answered);
+    items.push({
+      code: carrier.code,
+      kind: carrier.kind,
+      title: carrier.title,
+      subject: carrier.subject,
+      goal: carrier.goal,
+      date: today,
+      questionIds: due.map((x) => x.question.id),
+      pendingIds: pending.map((x) => x.question.id),
+      doneIds: due.filter((x) => x.answered).map((x) => x.question.id),
+      total: due.length,
+      done: due.length - pending.length
+    });
+  });
+  return {
+    today,
+    pending: items.filter((i) => i.pendingIds.length),
+    done: items.filter((i) => !i.pendingIds.length)
+  };
+}
+
+/* ---------------- 旧数据迁移到载体 ---------------- */
+
+function migrationMarker(uid) {
+  return path.join(userDir(uid), 'migrated-carriers-v2.json');
+}
+
+function migrateToCarriers(uid) {
+  if (fs.existsSync(migrationMarker(uid))) return { migrated: false };
+  ensureDir(carriersRoot(uid));
+  const created = [];
+
+  // 1) 旧试卷
+  try {
+    listPaperIndex(uid).forEach((summary) => {
+      try {
+        const paper = getPaper(uid, summary.id);
+        const qById = new Map((paper.questions || []).map((q) => [q.id, q]));
+        const sections = (paper.sections || []).map((section, si) => ({
+          id: `s${si + 1}`,
+          name: section.name || `第 ${si + 1} 部分`,
+          passage: section.passage || '',
+          date: '',
+          questions: (section.questionIds || []).map((qid) => qById.get(qid)).filter(Boolean)
+        }));
+        const carrier = saveCarrier(uid, {
+          kind: 'paper',
+          title: paper.title,
+          subject: paper.subject,
+          grade: paper.grade,
+          difficulty: paper.difficulty,
+          instructions: paper.instructions,
+          durationMinutes: paper.durationMinutes,
+          createdAt: paper.createdAt,
+          sections
+        });
+        const srcAttempts = path.join(userDir(uid), 'papers', paper.id, 'attempts');
+        if (fs.existsSync(srcAttempts)) {
+          fs.cpSync(srcAttempts, path.join(carrierDir(uid, carrier.code), 'attempts'), { recursive: true });
+        }
+        created.push(carrier.code);
+      } catch {
+        /* 单套失败不影响其它 */
+      }
+    });
+  } catch {
+    /* ignore */
+  }
+
+  // 2) 旧计划 + 3) 独立每日任务
+  let tasks = [];
+  try {
+    tasks = listTasks(uid);
+  } catch {
+    tasks = [];
+  }
+  const plans = listPlans(uid);
+  plans.forEach((plan) => {
+    const own = tasks.filter((t) => t.planId === plan.id).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    if (!own.length) return;
+    const sections = [];
+    const answers = {};
+    const grades = {};
+    const chatCopies = [];
+    own.forEach((task, ti) => {
+      const prefix = `t${ti + 1}_`;
+      const questions = (task.questions || []).map((q) => {
+        const id = `${prefix}${q.id}`;
+        if (task.answers[q.id]) answers[id] = task.answers[q.id];
+        if (task.grades[q.id]) grades[id] = task.grades[q.id];
+        chatCopies.push({ oldTaskId: task.id, oldQid: q.id, newQid: id });
+        return Object.assign({}, q, { id, date: task.date });
+      });
+      sections.push({
+        id: `s${ti + 1}`,
+        name: task.title || `第 ${ti + 1} 天`,
+        passage: '',
+        date: task.date,
+        questions
+      });
+    });
+    try {
+      const carrier = saveCarrier(uid, {
+        kind: 'plan',
+        title: plan.title,
+        subject: plan.subject,
+        goal: plan.goal,
+        createdAt: plan.createdAt,
+        sections
+      });
+      const attempt = {
+        id: rid('att'),
+        carrierCode: carrier.code,
+        kind: 'plan',
+        startedAt: plan.createdAt || nowIso(),
+        updatedAt: nowIso(),
+        finishedAt: null,
+        answers,
+        grades,
+        chatSessions: {},
+        summary: null
+      };
+      writeJson(path.join(carrierAttemptsDir(uid, carrier.code), attempt.id, 'attempt.json'), attempt);
+      chatCopies.forEach(({ oldTaskId, oldQid, newQid }) => {
+        const src = path.join(userDir(uid), 'tasks', 'chats', oldTaskId, `${oldQid}.jsonl`);
+        if (!fs.existsSync(src)) return;
+        const dest = carrierChatFile(uid, carrier.code, attempt.id, newQid);
+        ensureDir(path.dirname(dest));
+        fs.copyFileSync(src, dest);
+      });
+      created.push(carrier.code);
+    } catch {
+      /* ignore */
+    }
+  });
+
+  tasks
+    .filter((t) => !t.planId)
+    .forEach((task) => {
+      try {
+        const carrier = saveCarrier(uid, {
+          kind: 'practice',
+          title: task.title,
+          subject: task.subject,
+          createdAt: task.createdAt,
+          sections: [
+            {
+              id: 's1',
+              name: task.title,
+              passage: '',
+              date: task.date,
+              questions: (task.questions || []).map((q) => Object.assign({}, q, { date: task.date }))
+            }
+          ]
+        });
+        const attempt = {
+          id: rid('att'),
+          carrierCode: carrier.code,
+          kind: 'practice',
+          startedAt: task.createdAt || nowIso(),
+          updatedAt: nowIso(),
+          finishedAt: task.completedAt || null,
+          answers: task.answers || {},
+          grades: task.grades || {},
+          chatSessions: {},
+          summary: task.summary || null
+        };
+        writeJson(path.join(carrierAttemptsDir(uid, carrier.code), attempt.id, 'attempt.json'), attempt);
+        (task.questions || []).forEach((q) => {
+          const src = path.join(userDir(uid), 'tasks', 'chats', task.id, `${q.id}.jsonl`);
+          if (!fs.existsSync(src)) return;
+          const dest = carrierChatFile(uid, carrier.code, attempt.id, q.id);
+          ensureDir(path.dirname(dest));
+          fs.copyFileSync(src, dest);
+        });
+        created.push(carrier.code);
+      } catch {
+        /* ignore */
+      }
+    });
+
+  writeJson(migrationMarker(uid), { migratedAt: nowIso(), codes: created });
+  return { migrated: true, count: created.length, codes: created };
+}
+
 /* ---------------- 导出 ---------------- */
 
 function exportPaper(uid, paperId, dir) {
@@ -690,7 +1514,7 @@ module.exports = {
   listLegacyUsers,
   localUser,
   migrateLegacyUsers,
-  syncPaperFolder,
+  syncCarrierFolder,
   readUserSettings,
   saveUserSettings,
   userDir,
@@ -715,6 +1539,49 @@ module.exports = {
   appendChat,
   readAllChats,
   listHistory,
+  listPlans,
+  getPlan,
+  savePlan,
+  deletePlan,
+  listTasks,
+  getTask,
+  saveTask,
+  deleteTask,
+  setTaskAnswer,
+  setTaskGrade,
+  finishTask,
+  readTaskChat,
+  appendTaskChat,
+  listConversations,
+  getConversation,
+  saveConversation,
+  appendConversationMessage,
+  deleteConversation,
+  listConversationBriefs,
+  listCarriers,
+  getCarrier,
+  saveCarrier,
+  deleteCarrier,
+  newCarrierCode,
+  listCarrierBriefs,
+  listCarrierHistory,
+  carrierDaily,
+  carrierQuestionDate,
+  activeCarrierAttempt,
+  latestCarrierAttempt,
+  listCarrierAttemptIds,
+  getCarrierAttempt,
+  saveCarrierAttempt,
+  newCarrierAttempt,
+  setCarrierAnswer,
+  setCarrierGrade,
+  finishCarrierAttempt,
+  readCarrierChat,
+  appendCarrierChat,
+  readCarrierGlobalChat,
+  appendCarrierGlobalChat,
+  migrateToCarriers,
+  todayStr,
   exportPaper,
   paperStats
 };

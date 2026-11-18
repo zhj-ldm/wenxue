@@ -39,6 +39,7 @@ function typeLabel(type) {
 }
 
 function buildGradePrompt(paper, question, answer) {
+  const open = question.answerMode === 'open';
   return prompts.render('grade', {
     subject: paper.subject || '综合',
     grade: paper.grade || '通用',
@@ -47,7 +48,9 @@ function buildGradePrompt(paper, question, answer) {
     stem: question.stem,
     passageBlock: passageBlock(question),
     optionsBlock: optionsBlock(question),
-    referenceAnswer: question.referenceAnswer || '（未提供，请按学科常规标准判断）',
+    referenceAnswer: open
+      ? '（本题答案不唯一，不设标准答案，请按作答质量与评分细则判分）'
+      : question.referenceAnswer || '（未提供，请按学科常规标准判断）',
     rubric: rubricText(question),
     answer: String(answer || '').trim() || '（学生未作答）'
   });
@@ -67,7 +70,10 @@ function buildExplainPrompt(paper, question, answer, grade) {
   });
 }
 
-function buildQuestionContext(paper, question, index, count, answer, grade) {
+function buildQuestionContext(paper, question, index, count, answer, grade, section) {
+  const sectionInfo = section
+    ? `所属大题：${section.name || '未命名'}${section.passage ? `\n大题材料：\n${section.passage}` : ''}\n`
+    : '';
   return prompts.render('question_context', {
     subject: paper.subject || '综合',
     grade: paper.grade || '通用',
@@ -77,9 +83,9 @@ function buildQuestionContext(paper, question, index, count, answer, grade) {
     type: typeLabel(question.type),
     maxScore: question.maxScore,
     stem: question.stem,
-    passageBlock: passageBlock(question),
+    passageBlock: `${sectionInfo}${passageBlock(question)}`,
     optionsBlock: optionsBlock(question),
-    referenceAnswer: question.referenceAnswer || '（未提供）',
+    referenceAnswer: question.answerMode === 'open' ? '（答案不唯一，无标准答案）' : question.referenceAnswer || '（未提供）',
     rubric: rubricText(question),
     answer: String(answer || '').trim() || '（学生尚未作答）',
     grade: gradeText(grade)

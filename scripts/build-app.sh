@@ -26,6 +26,10 @@ rm -f "$RES/default_app.asar"
 rm -rf "$RES/app"
 mkdir -p "$RES/app"
 cp -R "$ROOT/electron" "$ROOT/renderer" "$ROOT/prompts" "$RES/app/"
+if [ -d "$ROOT/bin" ]; then
+  echo "→ 复制内置搜索工具（Aggr Search）"
+  cp -R "$ROOT/bin" "$RES/app/"
+fi
 
 echo "→ 复制运行时依赖（pi Agent）"
 while IFS= read -r pkg; do

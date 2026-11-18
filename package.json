@@ -30,6 +30,7 @@
       "electron/**/*",
       "renderer/**/*",
       "prompts/**/*",
+      "bin/**/*",
       "package.json"
     ],
     "win": {

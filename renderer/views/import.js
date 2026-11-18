@@ -7,9 +7,9 @@ export async function importPaperFile(ctx = {}, { subject = '' } = {}) {
   if (!file) return null;
   try {
     const read = await call('file:read', { filePath: file });
-    const res = await call('paper:import', { raw: read.content, subject });
-    toast(`已导入《${res.paper.title}》· ${res.paper.questions.length} 题 · ${res.paper.totalScore} 分`, 'ok');
-    if (ctx.go) ctx.go('library', { subject: res.paper.subject });
+    const res = await call('carrier:import', { raw: read.content, subject });
+    toast(`已导入《${res.carrier.title}》· 编号 ${res.carrier.code}`, 'ok');
+    if (ctx.go) ctx.go('home', { tab: 'papers' });
     return res;
   } catch (err) {
     toast(err.message || '导入失败', 'error');
