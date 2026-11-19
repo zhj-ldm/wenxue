@@ -5,6 +5,7 @@ import { renderHistory } from './views/history.js';
 import { renderSettings } from './views/settings.js';
 import { renderChat } from './views/chat.js';
 import { renderCarrier } from './views/carrier.js';
+import { mountInk } from './ink.js';
 
 export const state = {
   boot: null,
@@ -211,3 +212,4 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 
 boot();
+mountInk();
