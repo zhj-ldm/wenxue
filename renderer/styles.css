@@ -3911,12 +3911,23 @@ body[data-platform='win32'] .task-page {
   z-index: 55;
   pointer-events: none;
 }
-#ink-canvas {
-  display: block;
+#ink-doc {
+  position: absolute;
+  left: 0;
+  top: -66px;
   width: 100%;
-  height: 100%;
-  touch-action: none;
+  height: 100vh;
+  overflow: visible;
   pointer-events: none;
+  will-change: transform;
+}
+.ink-surface {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 9999;
 }
 
 body.ink-on { cursor: crosshair; }
