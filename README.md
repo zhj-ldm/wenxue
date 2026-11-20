@@ -7,7 +7,7 @@
 AI 出卷、你作答、逐题批改与追问；所有数据留在本机，模型用你自己填的接口。
 
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple&logoColor=white)](#下载)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)](LICENSE)
 [![Electron](https://img.shields.io/badge/Electron-45-47848F?logo=electron&logoColor=white)](package.json)
 [![Agent](https://img.shields.io/badge/Agent-pi-7C5CFF)](https://github.com/earendil-works/pi)
 
@@ -100,4 +100,4 @@ npm start                 # 开发模式
 
 软件本身不附带任何题库内容。请勿导入或分发无授权的版权试题，相关责任由使用者自行承担。
 
-本项目采用 Apache License 2.0 开源。
+本项目采用 PolyForm Noncommercial License 1.0.0：允许个人学习、研究、教学等非商业用途；未经授权不得用于商业目的。
