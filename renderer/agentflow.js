@@ -75,13 +75,13 @@ export function createAgentFlow(log, { modelLabel = 'AI', onUpdate } = {}) {
   function pushText(full) {
     fullText = String(full == null ? fullText : full);
     ensureTextBlock();
-    // 流式阶段按 80ms 节流刷新纯文本，结束时再渲染 Markdown
+    // 流式阶段同样按节流渲染 Markdown，边输出边排版；结束时再兜底渲染一次
     if (!textTimer) {
       textTimer = setTimeout(() => {
         textTimer = 0;
-        renderText(false);
+        renderText(true);
         update();
-      }, 80);
+      }, 60);
     }
     if (currentPhase) setPhase('');
   }
