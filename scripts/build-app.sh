@@ -41,11 +41,12 @@ while IFS= read -r pkg; do
 done < <(cd "$ROOT" && npm ls --omit=dev --all --parseable 2>/dev/null | tail -n +2)
 
 # productName 保持 Wenxue，让打包版与开发版共用同一份用户数据（~/Library/Application Support/Wenxue）
-cat > "$RES/app/package.json" <<'JSON'
+VERSION="$(cd "$ROOT" && node -p "require('./package.json').version")"
+cat > "$RES/app/package.json" <<JSON
 {
   "name": "wenxue",
   "productName": "Wenxue",
-  "version": "1.0.0",
+  "version": "$VERSION",
   "description": "内置 pi Agent 的 AI 试卷练习桌面应用",
   "main": "electron/main.js",
   "private": true
@@ -57,6 +58,8 @@ PB="$OUT_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$PB"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$PB"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$PB"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PB"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PB"
 
 if [ -f "$ROOT/assets/AppIcon.icns" ]; then
   echo "→ 安装图标"
