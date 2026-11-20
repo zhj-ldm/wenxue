@@ -262,15 +262,11 @@ function resolveModelCache() {
 
 function searchEnv() {
   const env = Object.assign({}, process.env);
+  // 新版默认 auto：本地有完整模型才启用向量重排，没有就用词法重排，绝不自动下载
+  env.HF_HUB_OFFLINE = env.HF_HUB_OFFLINE || '1';
   if (!env.AGGRSEARCH_EMBED_CACHE) {
     const cache = resolveModelCache();
-    if (cache) {
-      env.AGGRSEARCH_EMBED_CACHE = cache;
-      // 模型随包分发，禁止再联网拉模型；缓存不完整时自动回退词法重排
-      env.HF_HUB_OFFLINE = env.HF_HUB_OFFLINE || '1';
-    } else {
-      env.AGGRSEARCH_EMBED = env.AGGRSEARCH_EMBED || 'off';
-    }
+    if (cache) env.AGGRSEARCH_EMBED_CACHE = cache;
   }
   return env;
 }
@@ -333,8 +329,9 @@ async function waitSearchHealth(port, timeoutMs) {
         const body = await res.json().catch(() => null);
         if (body && body.status === 'ok') {
           last = body;
-          // 等模型预热完成，第一次搜索就不用再等加载
-          if (!body.embedding || !body.embedding.enabled || body.embedding.ready) return true;
+          // 新版健康检查字段：enabled / installed / loaded
+          const emb = body.embedding || {};
+          if (!emb.enabled || emb.loaded || !emb.installed) return true;
         }
       }
     } catch {
