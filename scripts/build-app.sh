@@ -28,7 +28,11 @@ mkdir -p "$RES/app"
 cp -R "$ROOT/electron" "$ROOT/renderer" "$ROOT/prompts" "$RES/app/"
 if [ -d "$ROOT/bin" ]; then
   echo "→ 复制内置搜索工具（Aggr Search）"
-  cp -R "$ROOT/bin" "$RES/app/"
+  mkdir -p "$RES/app/bin"
+  # 只带可执行文件，不把 bin/models 等本地模型/缓存打进安装包
+  for f in aggrsearch aggrsearch.exe; do
+    [ -f "$ROOT/bin/$f" ] && cp "$ROOT/bin/$f" "$RES/app/bin/$f"
+  done
 fi
 
 echo "→ 复制运行时依赖（pi Agent）"
@@ -52,6 +56,13 @@ cat > "$RES/app/package.json" <<JSON
   "private": true
 }
 JSON
+
+echo "→ 清理安装包内的用户数据与密钥（防止随包分发）"
+find "$RES/app" -path "$RES/app/node_modules" -prune -o -type f \
+  \( -name 'settings.json' -o -name 'profiles.json' -o -name 'conversations.json' \
+     -o -name '.env' -o -name '.env.*' -o -name '*.key' -o -name '*.pem' \) -print0 \
+  | xargs -0 rm -f 2>/dev/null || true
+rm -rf "$RES/app/data" "$RES/app/bin/models"
 
 echo "→ 修改 Info.plist"
 PB="$OUT_APP/Contents/Info.plist"
