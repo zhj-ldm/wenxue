@@ -175,6 +175,7 @@ function normalizeQuestion(raw, index, sectionName) {
     options: type === 'choice' || type === 'multi_choice' ? options : options.length ? options : [],
     maxScore,
     referenceAnswer: referenceAnswer || (type === 'choice' ? 'A' : ''),
+    sampleAnswer: String(pick(raw, ['sampleAnswer', 'sample', 'modelAnswer', '示范答案', '示例答案', '标准答案示例']) || '').trim(),
     rubric: normalizeRubric(raw.rubric || raw.评分细则 || raw.scoring || raw.criteria, scoreForRubric),
     knowledgePoints,
     difficulty: Math.min(5, Math.max(1, Math.round(toNumber(raw.difficulty, 3)))),
@@ -325,6 +326,7 @@ function normalizeCarrier(raw, opts = {}) {
     durationMinutes: Math.max(0, Math.round(toNumber(src.durationMinutes, 0))),
     instructions: String(src.instructions || '').trim(),
     sourceFile: String(src.sourceFile || '').trim(),
+    homeDir: String(src.homeDir || '').trim(),
     createdAt: src.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     sections

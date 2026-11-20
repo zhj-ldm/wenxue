@@ -38,6 +38,12 @@ function typeLabel(type) {
   return `${TYPE_LABEL[type] || type}（${type}）`;
 }
 
+function sampleBlock(question) {
+  const sample = String(question.sampleAnswer || '').trim();
+  if (!sample) return '';
+  return `- 示范答案（仅供讲解参考，不参与自动批改）：${sample}\n`;
+}
+
 function buildGradePrompt(paper, question, answer) {
   const open = question.answerMode === 'open';
   return prompts.render('grade', {
@@ -64,6 +70,7 @@ function buildExplainPrompt(paper, question, answer, grade) {
     passageBlock: passageBlock(question),
     optionsBlock: optionsBlock(question),
     referenceAnswer: question.referenceAnswer || '（未提供）',
+    sampleAnswer: sampleBlock(question),
     rubric: rubricText(question),
     answer: String(answer || '').trim() || '（学生未作答）',
     grade: gradeText(grade)
@@ -86,6 +93,7 @@ function buildQuestionContext(paper, question, index, count, answer, grade, sect
     passageBlock: `${sectionInfo}${passageBlock(question)}`,
     optionsBlock: optionsBlock(question),
     referenceAnswer: question.answerMode === 'open' ? '（答案不唯一，无标准答案）' : question.referenceAnswer || '（未提供）',
+    sampleAnswer: sampleBlock(question),
     rubric: rubricText(question),
     answer: String(answer || '').trim() || '（学生尚未作答）',
     grade: gradeText(grade)

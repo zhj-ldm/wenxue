@@ -198,6 +198,10 @@ function makeTools(baseDir, hooks = {}) {
                         options: { type: 'array', items: { type: 'object' } },
                         maxScore: { type: 'number' },
                         referenceAnswer: { type: 'string' },
+                        sampleAnswer: {
+                          type: 'string',
+                          description: '示范标准答案，仅供讲解与对话参考，不参与自动批改'
+                        },
                         rubric: { type: 'array', items: { type: 'object' } },
                         knowledgePoints: { type: 'array', items: { type: 'string' } },
                         difficulty: { type: 'number' },

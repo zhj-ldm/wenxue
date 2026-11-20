@@ -31,14 +31,16 @@ function readJson(file, fallback) {
   }
 }
 
-function writeJson(file, value) {
+function writeJson(file, value, options = {}) {
   ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
-  try {
-    if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak`);
-  } catch {
-    /* 备份失败不影响正常写入 */
+  if (options.backup !== false) {
+    try {
+      if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak`);
+    } catch {
+      /* 备份失败不影响正常写入 */
+    }
   }
   fs.renameSync(tmp, file);
   return value;
@@ -401,8 +403,12 @@ function walkJsonFiles(dir, out = [], depth = 0) {
   for (const entry of entries) {
     if (entry.name.startsWith('.')) continue;
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) walkJsonFiles(full, out, depth + 1);
-    else if (/\.json$/i.test(entry.name)) out.push(full);
+    if (entry.isDirectory()) {
+      const lower = entry.name.toLowerCase();
+      // 作答与会话目录里也有 json，不能当载体扫描
+      if (lower === 'attempts' || lower === 'chats' || lower === 'node_modules') continue;
+      walkJsonFiles(full, out, depth + 1);
+    } else if (/\.json$/i.test(entry.name)) out.push(full);
   }
   return out;
 }
@@ -434,7 +440,8 @@ function carrierFromFile(raw) {
   });
 }
 
-// 扫描「放题目录」，把尚未收录的 JSON 自动导入为载体（试卷/练习/提升计划）
+// 扫描「放题目录」，把尚未收录的题目自动导入为载体（试卷/练习/提升计划）
+// 目录约定：<放题目录>/<学科>/<题目名>/paper.json（同目录下还有 attempts 与会话）
 function syncCarrierFolder(uid, { force = false } = {}) {
   const dir = path.resolve(readUserSettings(uid).exportDir);
   if (!force && scanCache.result && scanCache.dir === dir && Date.now() - scanCache.at < 8000) {
@@ -447,7 +454,29 @@ function syncCarrierFolder(uid, { force = false } = {}) {
   const added = [];
   let skipped = 0;
 
-  for (const file of files) {
+  for (const found of files) {
+    let file = found;
+    let homeDir = '';
+
+    if (path.basename(file).toLowerCase() === 'paper.json') {
+      homeDir = path.dirname(file);
+    } else {
+      // 旧格式的平铺 JSON：转成「同名文件夹/paper.json」，作答与题目就能放在一起
+      const folder = path.join(path.dirname(file), safeFolderName(path.basename(file, path.extname(file))));
+      const target = path.join(folder, 'paper.json');
+      try {
+        if (!fs.existsSync(target)) {
+          ensureDir(folder);
+          fs.renameSync(file, target);
+        }
+      } catch {
+        skipped += 1;
+        continue;
+      }
+      file = target;
+      homeDir = folder;
+    }
+
     let raw = null;
     try {
       raw = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -465,10 +494,10 @@ function syncCarrierFolder(uid, { force = false } = {}) {
     const key = `${carrier.title}::${carrier.totalScore}::${papersLib.carrierQuestions(carrier).length}`;
     const hit = byKey.get(key);
     if (hit) {
-      // 补记来源文件，这样在应用里删除时能同时删掉源 JSON，避免重启后又被导入
-      if (!hit.sourceFile) {
+      // 补记来源与文件夹，这样作答会写到题目旁边，删除时也能整夹删掉
+      if (!hit.sourceFile || !hit.homeDir) {
         try {
-          saveCarrier(uid, Object.assign({}, hit, { sourceFile: file }));
+          saveCarrier(uid, Object.assign({}, hit, { sourceFile: file, homeDir }));
         } catch {
           /* ignore */
         }
@@ -476,7 +505,7 @@ function syncCarrierFolder(uid, { force = false } = {}) {
       continue;
     }
     try {
-      carrier = saveCarrier(uid, Object.assign({}, carrier, { sourceFile: file }));
+      carrier = saveCarrier(uid, Object.assign({}, carrier, { sourceFile: file, homeDir }));
     } catch {
       skipped += 1;
       continue;
@@ -995,6 +1024,78 @@ function carrierFile(uid, code) {
   return path.join(carrierDir(uid, code), 'carrier.json');
 }
 
+/* ---- 载体在放题目录中的「家」：<学科>/<题目名>/paper.json + attempts/ ---- */
+
+function exportRoot(uid) {
+  return path.resolve(readUserSettings(uid).exportDir);
+}
+
+function isInsideExportRoot(uid, absPath) {
+  try {
+    const root = exportRoot(uid);
+    const target = path.resolve(absPath);
+    return target === root || target.startsWith(`${root}${path.sep}`);
+  } catch {
+    return false;
+  }
+}
+
+function safeFolderName(value) {
+  const cleaned = String(value || '')
+    .replace(/[\/\\:*?"<>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+/, '');
+  return cleaned.slice(0, 80) || '未命名';
+}
+
+function codeOf(carrier) {
+  return String((carrier && carrier.code) || '').toUpperCase();
+}
+
+// 选定载体文件夹；重名时加编号区分
+function pickCarrierHome(uid, carrier) {
+  const existing = String((carrier && carrier.homeDir) || '').trim();
+  if (existing) return existing;
+  const root = exportRoot(uid);
+  const base = path.join(
+    root,
+    safeFolderName((carrier && carrier.subject) || '综合'),
+    safeFolderName((carrier && carrier.title) || '未命名')
+  );
+  const code = codeOf(carrier);
+  let home = base;
+  for (let i = 0; i < 30 && fs.existsSync(home); i += 1) {
+    const owner = readJson(path.join(home, 'paper.json'), null);
+    if (!owner || codeOf(owner) === code) break;
+    home = `${base} (${code || i + 1})`;
+  }
+  return home;
+}
+
+function carrierHomeDir(uid, carrier) {
+  return ensureDir(pickCarrierHome(uid, carrier));
+}
+
+// 把载体正文同步一份到题目文件夹，并记住位置
+function exportCarrierFile(uid, carrier) {
+  const home = carrierHomeDir(uid, carrier);
+  const file = path.join(home, 'paper.json');
+  // 题目正文的权威副本在应用数据里，这里的 paper.json 不需要 .bak
+  writeJson(file, Object.assign({}, carrier, { homeDir: home, sourceFile: file }), { backup: false });
+  try {
+    fs.rmSync(`${file}.bak`, { force: true });
+  } catch {
+    /* ignore */
+  }
+  if (String(carrier.homeDir || '') !== home || String(carrier.sourceFile || '') !== file) {
+    carrier.homeDir = home;
+    carrier.sourceFile = file;
+    writeJson(carrierFile(uid, carrier.code), carrier);
+  }
+  return file;
+}
+
 function newCarrierCode(uid) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     let code = '';
@@ -1030,19 +1131,31 @@ function saveCarrier(uid, patch = {}) {
     Object.assign({}, exist || {}, patch, { code, createdAt: (exist && exist.createdAt) || patch.createdAt || nowIso() })
   );
   writeJson(carrierFile(uid, code), carrier);
+  // 同时维护放题目录里的文件夹，让题目与作答始终在一起
+  try {
+    exportCarrierFile(uid, carrier);
+  } catch {
+    /* 放题目录不可写时不阻塞内部保存 */
+  }
   return carrier;
 }
 
 function deleteCarrier(uid, code) {
   const carrier = readJson(carrierFile(uid, code), null);
-  // 从放题目录同步进来的载体：同时删掉源文件，否则下次启动又会被扫回来
-  if (carrier && carrier.sourceFile) {
+  // 优先整夹删除；没有 homeDir 的老数据再退回删源文件
+  if (carrier && carrier.homeDir) {
     try {
-      const root = path.resolve(readUserSettings(uid).exportDir);
-      const abs = path.resolve(carrier.sourceFile);
-      if (abs.startsWith(`${root}${path.sep}`) && /\.json$/i.test(abs)) fs.rmSync(abs, { force: true });
+      const home = path.resolve(carrier.homeDir);
+      if (isInsideExportRoot(uid, home)) fs.rmSync(home, { recursive: true, force: true });
     } catch {
-      /* 源文件删除失败不影响载体删除 */
+      /* 删除失败不影响后面的内部清理 */
+    }
+  } else if (carrier && carrier.sourceFile) {
+    try {
+      const abs = path.resolve(carrier.sourceFile);
+      if (isInsideExportRoot(uid, abs) && /\.json$/i.test(abs)) fs.rmSync(abs, { force: true });
+    } catch {
+      /* ignore */
     }
   }
   fs.rmSync(carrierDir(uid, code), { recursive: true, force: true });
@@ -1052,7 +1165,15 @@ function deleteCarrier(uid, code) {
 /* ---------------- 载体作答 ---------------- */
 
 function carrierAttemptsDir(uid, code) {
-  return ensureDir(path.join(carrierDir(uid, code), 'attempts'));
+  const carrier = getCarrier(uid, code);
+  let base;
+  try {
+    base = carrier.homeDir ? carrierHomeDir(uid, carrier) : path.dirname(exportCarrierFile(uid, carrier));
+  } catch {
+    // 放题目录不可用时退回内部目录，至少不丢作答
+    base = carrierDir(uid, code);
+  }
+  return ensureDir(path.join(base, 'attempts'));
 }
 
 function listCarrierAttemptIds(uid, code) {
@@ -1189,7 +1310,14 @@ function appendCarrierChat(uid, code, attemptId, questionId, message) {
 }
 
 function carrierGlobalChatFile(uid, code) {
-  return path.join(carrierDir(uid, code), 'global-chat.jsonl');
+  const carrier = getCarrier(uid, code);
+  let base;
+  try {
+    base = carrier.homeDir ? carrierHomeDir(uid, carrier) : path.dirname(exportCarrierFile(uid, carrier));
+  } catch {
+    base = carrierDir(uid, code);
+  }
+  return path.join(base, 'global-chat.jsonl');
 }
 
 function readCarrierGlobalChat(uid, code) {
@@ -1476,6 +1604,91 @@ function migrateToCarriers(uid) {
   return { migrated: true, count: created.length, codes: created };
 }
 
+/* ---------------- 迁移：把作答搬进题目文件夹 ---------------- */
+
+function homeMigrationMarker(uid) {
+  return path.join(userDir(uid), 'migrated-carrier-homes-v1.json');
+}
+
+// 每套题在放题目录里一个文件夹：paper.json + attempts + 会话。
+// 旧数据（题目平铺 JSON、内部 attempts）会复制到新位置，原始文件保留作备份。
+function migrateCarrierHomes(uid) {
+  if (fs.existsSync(homeMigrationMarker(uid))) return { migrated: false };
+
+  const moved = [];
+  listCarriers(uid).forEach((carrier) => {
+    try {
+      const code = codeOf(carrier);
+      let home = String(carrier.homeDir || '').trim();
+      let source = String(carrier.sourceFile || '').trim();
+
+      if (!home) {
+        if (source && isInsideExportRoot(uid, source)) {
+          if (path.basename(source).toLowerCase() === 'paper.json') {
+            home = path.dirname(source);
+          } else {
+            const folder = path.join(path.dirname(source), safeFolderName(path.basename(source, path.extname(source))));
+            const target = path.join(folder, 'paper.json');
+            home = folder;
+            try {
+              if (!fs.existsSync(target)) {
+                ensureDir(folder);
+                fs.renameSync(source, target);
+              }
+            } catch {
+              /* 移动失败就用原目录 */
+            }
+          }
+        } else {
+          home = pickCarrierHome(uid, carrier);
+        }
+      }
+
+      ensureDir(home);
+
+      // 旧作答：复制到题目文件夹，内部原件保留，避免任何丢失
+      const legacyAttempts = path.join(carrierDir(uid, code), 'attempts');
+      const homeAttempts = path.join(home, 'attempts');
+      if (fs.existsSync(legacyAttempts)) {
+        ensureDir(homeAttempts);
+        fs.readdirSync(legacyAttempts, { withFileTypes: true }).forEach((entry) => {
+          if (!entry.isDirectory()) return;
+          const from = path.join(legacyAttempts, entry.name);
+          const to = path.join(homeAttempts, entry.name);
+          if (fs.existsSync(to)) return;
+          try {
+            fs.cpSync(from, to, { recursive: true });
+          } catch {
+            /* 单条失败不影响其它 */
+          }
+        });
+      }
+
+      const legacyGlobal = path.join(carrierDir(uid, code), 'global-chat.jsonl');
+      const homeGlobal = path.join(home, 'global-chat.jsonl');
+      if (fs.existsSync(legacyGlobal) && !fs.existsSync(homeGlobal)) {
+        try {
+          fs.copyFileSync(legacyGlobal, homeGlobal);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      saveCarrier(uid, Object.assign({}, carrier, {
+        code,
+        homeDir: home,
+        sourceFile: path.join(home, 'paper.json')
+      }));
+      moved.push(code);
+    } catch {
+      /* 单套失败不影响启动 */
+    }
+  });
+
+  writeJson(homeMigrationMarker(uid), { migratedAt: nowIso(), codes: moved });
+  return { migrated: true, count: moved.length, codes: moved };
+}
+
 /* ---------------- 导出 ---------------- */
 
 function exportPaper(uid, paperId, dir) {
@@ -1581,6 +1794,7 @@ module.exports = {
   readCarrierGlobalChat,
   appendCarrierGlobalChat,
   migrateToCarriers,
+  migrateCarrierHomes,
   todayStr,
   exportPaper,
   paperStats

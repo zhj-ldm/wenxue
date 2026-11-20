@@ -15,7 +15,7 @@
 {{passageBlock}}
 {{optionsBlock}}
 - 参考答案：{{referenceAnswer}}
-- 评分细则：{{rubric}}
+{{sampleAnswer}}- 评分细则：{{rubric}}
 
 ## 学生当前作答
 

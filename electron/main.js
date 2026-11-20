@@ -199,10 +199,11 @@ function agentContext(uid) {
     '   只能用 create_carrier / update_carrier / find_carrier / list_carriers / delete_carrier 工具创建和修改，不要手写文件。',
     '   每个载体自动生成 8 位编号（如 A7K2M9Q1），用户可以用编号找你检索；回复时提到载体要带上编号。',
     '2. 载体结构：{kind,title,subject,grade,goal,instructions,durationMinutes,sections:[{name,passage,date,questions:[...]}]}。',
-    '   题目字段：{id,type,layout,stem,passage,blanks,options,maxScore,referenceAnswer,rubric,knowledgePoints,difficulty,date,answerMode,actions}。',
+    '   题目字段：{id,type,layout,stem,passage,blanks,options,maxScore,referenceAnswer,sampleAnswer,rubric,knowledgePoints,difficulty,date,answerMode,actions}。',
     '   date 写 YYYY-MM-DD：大题写 date，小题自动继承；小题也可单独写 date。到期（当天或已过期未做）会自动出现在「每日任务」。',
     '   actions 控制题目按钮：{"grade":true,"explain":true,"chat":true}，false 则不显示对应按钮。',
     '   answerMode 取 fixed（有标准答案）或 open（答案不唯一，不设标准答案，由你判分）。',
+    '   sampleAnswer 是「示范标准答案」，只用于讲解和对话参考，不参与自动批改；开放题可以靠它给出范例。',
     '3. 填空题（语篇填空、语法填空、默写）默认内联：layout 写 "inline"，在 passage 或 stem 里用 {{1}}、{{2}} 标出空位，blanks 给出每个空的 key/answer/maxScore。示例：',
     '   {"id":"q1","type":"fill_blank","layout":"inline","stem":"The Great Wall {{1}} (build) long ago, and it {{2}} (visit) by many people every year.","blanks":[{"key":"1","answer":"was built","maxScore":1},{"key":"2","answer":"is visited","maxScore":1}],"maxScore":2,"referenceAnswer":"1. was built  2. is visited","rubric":[{"point":"时态与语态","score":2}]}',
     '   普通问答题用 block（不写 layout 即可），不要把一个空拆成一道小题。',
@@ -751,6 +752,11 @@ if (!gotLock) {
       store.migrateToCarriers(store.localUser().id);
     } catch {
       /* 迁移失败不阻塞启动 */
+    }
+    try {
+      store.migrateCarrierHomes(store.localUser().id);
+    } catch {
+      /* 同上 */
     }
     createWindow();
     app.on('activate', () => {
