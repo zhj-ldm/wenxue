@@ -237,7 +237,44 @@ function resolveSearchBin() {
   return '';
 }
 
-function execSearchBin(args, timeout = 45000) {
+// 新版 Aggr Search 自带本地向量模型；优先用随包分发的模型缓存，避免首启联网下载
+const EMBED_REPO_DIR = 'models--onnx-community--embeddinggemma-300m-ONNX';
+
+function modelCacheCandidates() {
+  const list = [];
+  if (process.resourcesPath) list.push(path.join(process.resourcesPath, 'bin', 'models'));
+  list.push(path.join(__dirname, '..', 'bin', 'models'));
+  list.push(path.join(app.getAppPath(), 'bin', 'models'));
+  return list;
+}
+
+function resolveModelCache() {
+  for (const dir of modelCacheCandidates()) {
+    try {
+      if (fs.existsSync(path.join(dir, EMBED_REPO_DIR))) return dir;
+    } catch {
+      /* ignore */
+    }
+  }
+  return '';
+}
+
+function searchEnv() {
+  const env = Object.assign({}, process.env);
+  if (!env.AGGRSEARCH_EMBED_CACHE) {
+    const cache = resolveModelCache();
+    if (cache) {
+      env.AGGRSEARCH_EMBED_CACHE = cache;
+      // 模型随包分发，禁止再联网拉模型；缓存不完整时自动回退词法重排
+      env.HF_HUB_OFFLINE = env.HF_HUB_OFFLINE || '1';
+    } else {
+      env.AGGRSEARCH_EMBED = env.AGGRSEARCH_EMBED || 'off';
+    }
+  }
+  return env;
+}
+
+function execSearchBin(args, timeout = 120000) {
   const bin = resolveSearchBin();
   if (!bin) {
     return Promise.reject(
@@ -245,7 +282,7 @@ function execSearchBin(args, timeout = 45000) {
     );
   }
   return new Promise((resolve, reject) => {
-    execFile(bin, args, { timeout, maxBuffer: 8 * 1024 * 1024, env: process.env }, (err, stdout, stderr) => {
+    execFile(bin, args, { timeout, maxBuffer: 8 * 1024 * 1024, env: searchEnv() }, (err, stdout, stderr) => {
       const out = String(stdout || '').trim();
       if (err && !out) {
         reject(new Error(`搜索失败：${String(stderr || err.message || '').slice(0, 300)}`));

@@ -27,12 +27,15 @@ rm -rf "$RES/app"
 mkdir -p "$RES/app"
 cp -R "$ROOT/electron" "$ROOT/renderer" "$ROOT/prompts" "$RES/app/"
 if [ -d "$ROOT/bin" ]; then
-  echo "→ 复制内置搜索工具（Aggr Search）"
+  echo "→ 复制内置搜索工具（Aggr Search + 本地向量模型）"
   mkdir -p "$RES/app/bin"
-  # 只带可执行文件，不把 bin/models 等本地模型/缓存打进安装包
   for f in aggrsearch aggrsearch.exe; do
     [ -f "$ROOT/bin/$f" ] && cp "$ROOT/bin/$f" "$RES/app/bin/$f"
   done
+  # 新版带本地 embedding 模型，必须随包分发，避免首次启动联网下载
+  if [ -d "$ROOT/bin/models" ]; then
+    cp -cR "$ROOT/bin/models" "$RES/app/bin/models" 2>/dev/null || cp -R "$ROOT/bin/models" "$RES/app/bin/models"
+  fi
 fi
 
 echo "→ 复制运行时依赖（pi Agent）"
@@ -62,7 +65,7 @@ find "$RES/app" -path "$RES/app/node_modules" -prune -o -type f \
   \( -name 'settings.json' -o -name 'profiles.json' -o -name 'conversations.json' \
      -o -name '.env' -o -name '.env.*' -o -name '*.key' -o -name '*.pem' \) -print0 \
   | xargs -0 rm -f 2>/dev/null || true
-rm -rf "$RES/app/data" "$RES/app/bin/models"
+rm -rf "$RES/app/data"
 
 echo "→ 修改 Info.plist"
 PB="$OUT_APP/Contents/Info.plist"
