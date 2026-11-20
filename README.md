@@ -101,3 +101,5 @@ npm start                 # 开发模式
 软件本身不附带任何题库内容。请勿导入或分发无授权的版权试题，相关责任由使用者自行承担。
 
 本项目采用 PolyForm Noncommercial License 1.0.0：允许个人学习、研究、教学等非商业用途；未经授权不得用于商业目的。
+
+Required Notice: Copyright (c) 2026 zhj-ldm
