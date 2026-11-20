@@ -32,6 +32,8 @@
       "renderer/**/*",
       "prompts/**/*",
       "bin/**/*",
+      "!bin/aggrsearch",
+      "!bin/models/**",
       "package.json"
     ],
     "win": {
