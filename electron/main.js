@@ -3,7 +3,8 @@
 const path = require('path');
 const fs = require('fs');
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
-const { exec, execFile } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
+const net = require('net');
 
 const store = require('./lib/store');
 const pi = require('./lib/pi');
@@ -293,6 +294,125 @@ function execSearchBin(args, timeout = 120000) {
   });
 }
 
+/* ---- 常驻搜索服务：模型只加载一次，后续搜索直接复用 ---- */
+
+let searchService = null; // { port, proc }
+let searchServicePromise = null;
+
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+function stopSearchService() {
+  if (searchService && searchService.proc) {
+    try {
+      searchService.proc.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+  searchService = null;
+  searchServicePromise = null;
+}
+
+async function waitSearchHealth(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
+      if (res.ok) {
+        const body = await res.json().catch(() => null);
+        if (body && body.status === 'ok') {
+          last = body;
+          // 等模型预热完成，第一次搜索就不用再等加载
+          if (!body.embedding || !body.embedding.enabled || body.embedding.ready) return true;
+        }
+      }
+    } catch {
+      /* 服务还没起来 */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return !!last;
+}
+
+async function startSearchService() {
+  const bin = resolveSearchBin();
+  if (!bin) throw new Error('没有找到内置搜索工具');
+  for (let i = 0; i < 3; i += 1) {
+    const port = await getFreePort();
+    const proc = spawn(bin, ['serve', '--port', String(port)], {
+      env: searchEnv(),
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
+    proc.stderr.on('data', () => {});
+    proc.on('error', () => {});
+    proc.on('exit', () => {
+      if (searchService && searchService.proc === proc) {
+        searchService = null;
+        searchServicePromise = null;
+      }
+    });
+    const ok = await waitSearchHealth(port, 30000);
+    if (ok) return { port, proc };
+    try {
+      proc.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+  throw new Error('搜索服务启动失败');
+}
+
+function ensureSearchService() {
+  if (searchService) return Promise.resolve(searchService);
+  if (!searchServicePromise) {
+    searchServicePromise = startSearchService()
+      .then((svc) => {
+        searchService = svc;
+        return svc;
+      })
+      .catch((err) => {
+        searchServicePromise = null;
+        throw err;
+      });
+  }
+  return searchServicePromise;
+}
+
+function formatSearchResults(query, data, limit) {
+  const results = data && Array.isArray(data.results) ? data.results.slice(0, limit) : [];
+  if (!results.length) return `查询：${query}\n（没有搜索到结果）`;
+  const lines = results.map((r, i) => {
+    const snippet = String(r.snippet || r.content || '').replace(/\s+/g, ' ').slice(0, 260);
+    return `${i + 1}. ${r.title || '(无标题)'}\n   ${r.url || ''}\n   ${snippet}`;
+  });
+  return `查询：${query}\n${lines.join('\n')}`;
+}
+
+async function httpSearch(port, query, limit) {
+  const url = `http://127.0.0.1:${port}/search?q=${encodeURIComponent(query)}&max_results=${limit}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(120000) });
+  if (!res.ok) throw new Error(`搜索服务返回 ${res.status}`);
+  return res.json();
+}
+
+async function httpFetch(port, target) {
+  const url = `http://127.0.0.1:${port}/fetch?url=${encodeURIComponent(target)}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(120000) });
+  if (!res.ok) throw new Error(`抓取服务返回 ${res.status}`);
+  return res.json();
+}
+
 async function webSearch(uid, { query, count, max } = {}) {
   const q = String(query || '').trim();
   if (!q) throw new Error('搜索关键词为空');
@@ -316,20 +436,21 @@ async function webSearch(uid, { query, count, max } = {}) {
     return out ? out.slice(0, 20000) : '没有搜索到结果。';
   }
 
-  const raw = await execSearchBin(['search', q, '--max', String(limit), '--json']);
-  let data = null;
   try {
-    data = JSON.parse(raw);
+    const svc = await ensureSearchService();
+    const data = await httpSearch(svc.port, q, limit);
+    return formatSearchResults(q, data, limit);
   } catch {
-    return raw.slice(0, 20000) || '没有搜索到结果。';
+    // 常驻服务异常时退回单次 CLI，保证搜索仍可用
+    const raw = await execSearchBin(['search', q, '--max', String(limit), '--json']);
+    let data = null;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return raw.slice(0, 20000) || '没有搜索到结果。';
+    }
+    return formatSearchResults(q, data, limit);
   }
-  const results = Array.isArray(data.results) ? data.results.slice(0, limit) : [];
-  if (!results.length) return `查询：${q}\n（没有搜索到结果）`;
-  const lines = results.map((r, i) => {
-    const snippet = String(r.snippet || r.content || '').replace(/\s+/g, ' ').slice(0, 260);
-    return `${i + 1}. ${r.title || '(无标题)'}\n   ${r.url || ''}\n   ${snippet}`;
-  });
-  return `查询：${q}\n${lines.join('\n')}`;
 }
 
 async function webFetch(uid, { url } = {}) {
@@ -349,12 +470,18 @@ async function webFetch(uid, { url } = {}) {
     });
     return out.slice(0, 20000) || '没有抓到内容。';
   }
-  const raw = await execSearchBin(['fetch', target, '--json'], 60000);
   let data = null;
   try {
-    data = JSON.parse(raw);
+    const svc = await ensureSearchService();
+    data = await httpFetch(svc.port, target);
   } catch {
-    return raw.slice(0, 20000);
+    // 常驻服务异常时退回单次 CLI
+    const raw = await execSearchBin(['fetch', target, '--json'], 120000);
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return raw.slice(0, 20000);
+    }
   }
   if (data.error) throw new Error(`抓取失败：${data.error}`);
   return `${target}\n\n${String(data.body || data.content || '').slice(0, 16000)}`;
@@ -796,10 +923,22 @@ if (!gotLock) {
       /* 同上 */
     }
     createWindow();
+    // 后台预热常驻搜索服务：模型只加载一次，之后每次搜索直接复用
+    setTimeout(() => {
+      try {
+        const uid = store.localUser().id;
+        if (String(store.readUserSettings(uid).searchCmd || '').trim()) return;
+        ensureSearchService().catch(() => {});
+      } catch {
+        /* 预热失败不影响启动，首次搜索会再尝试 */
+      }
+    }, 2500);
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   });
+
+  app.on('before-quit', stopSearchService);
 
   app.on('window-all-closed', () => {
     pi.cancelAll();
